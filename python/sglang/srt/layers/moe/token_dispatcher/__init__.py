@@ -11,10 +11,14 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
     DeepEPDispatcher,
+    ExpertSlotInfo,
     DeepEPLLCombineInput,
     DeepEPLLDispatchOutput,
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
+    PartialAggregator,
+    PartialAggregatorState,
+    XLayerDeepEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
@@ -71,9 +75,13 @@ __all__ = [
     "StandardCombineInput",
     "DeepEPConfig",
     "DeepEPDispatcher",
+    "XLayerDeepEPDispatcher",
     "DeepEPNormalDispatchOutput",
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
+    "PartialAggregator",
+    "PartialAggregatorState",
+    "ExpertSlotInfo",
     "NpuFuseEPDispatcher",
 ]

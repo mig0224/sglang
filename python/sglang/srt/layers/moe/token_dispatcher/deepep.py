@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from enum import Enum, IntEnum, auto
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 try:
     from deep_ep import Buffer, Config
+    from deep_ep.buffers.xlayers import XLayerScheduler
 
     if not _is_npu:
         from sglang.srt.layers.quantization.fp8_kernel import (
@@ -50,8 +52,7 @@ try:
     use_deepep = True
 except ImportError:
     use_deepep = False
-
-from enum import Enum, IntEnum, auto
+    XLayerScheduler = None
 
 import torch
 import torch.distributed as dist
@@ -746,6 +747,242 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
+class PartialAggregatorState(Enum):
+    S_INIT = auto()
+    S_DISPATCH_SUBMITTED = auto()
+    S_AWAITING_PARTIALS = auto()
+    S_AGGREGATE_COMPLETE = auto()
+    S_RELEASED = auto()
+
+
+@dataclass(order=True)
+class ExpertSlotInfo:
+    layer_id: int
+    arrival_tick: int
+    request_id: str
+    rank_id: int
+
+
+@dataclass
+class PartialAggregator:
+    y_accum: torch.Tensor
+    ep_handle: Any
+    partner_expected_bits: int
+    partner_received_bits: int = 0
+    expected_partner_count: int = 0
+    received_partner_count: int = 0
+    state: PartialAggregatorState = PartialAggregatorState.S_INIT
+
+    def __post_init__(self):
+        self.partner_expected_bits &= (1 << 64) - 1
+        self.expected_partner_count = int(self.partner_expected_bits.bit_count())
+
+    def mark_dispatch_submitted(self) -> None:
+        self.state = PartialAggregatorState.S_DISPATCH_SUBMITTED
+
+    def add_partial(self, partner_rank: int, partial_output: torch.Tensor) -> bool:
+        self.y_accum.add_(partial_output)
+        self.state = PartialAggregatorState.S_AWAITING_PARTIALS
+        if 0 <= partner_rank < 64:
+            partner_bit = 1 << partner_rank
+            if (
+                (self.partner_expected_bits & partner_bit) != 0
+                and (self.partner_received_bits & partner_bit) == 0
+            ):
+                self.partner_received_bits |= partner_bit
+                self.received_partner_count += 1
+        if self.received_partner_count >= self.expected_partner_count:
+            self.state = PartialAggregatorState.S_AGGREGATE_COMPLETE
+            return True
+        return False
+
+    def release(self) -> None:
+        self.state = PartialAggregatorState.S_RELEASED
+
+
+class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
+    _warned_fallback = False
+
+    def __init__(self, layer_id: int, **kwargs):
+        super().__init__(**kwargs)
+        self.layer_id = layer_id
+        self._arrival_tick = 0
+        self._last_request_id: Optional[str] = None
+        self._aggregators: Dict[Tuple[str, int], PartialAggregator] = {}
+        self._expert_slot_infos: Dict[Tuple[str, int], ExpertSlotInfo] = {}
+        self._rank = dist.get_rank(group=self.group)
+        self._scheduler = self._init_scheduler()
+
+    def _init_scheduler(self):
+        if XLayerScheduler is None:
+            return None
+        try:
+            return XLayerScheduler(group=self.group, hidden_size=self.hidden_size)
+        except TypeError:
+            try:
+                return XLayerScheduler(group=self.group)
+            except TypeError:
+                return XLayerScheduler()
+
+    def _warn_and_fallback(self, exc: Exception):
+        if not self._warned_fallback:
+            logger.warning(
+                "Falling back to DeepEP normal dispatcher because XLayer scheduler is unavailable: %s",
+                exc,
+            )
+            self.__class__._warned_fallback = True
+
+    def _call_xlayer(self, method_name: str, **kwargs):
+        if self._scheduler is None:
+            raise RuntimeError("XLayer scheduler is not initialized")
+        method = getattr(self._scheduler, method_name)
+        try:
+            return method(**kwargs)
+        except TypeError:
+            if method_name == "xlayer_poll":
+                return method()
+            if method_name in ("xlayer_take_dispatch", "xlayer_take_combine"):
+                return method(kwargs["request_id"], kwargs["layer_id"])
+            if method_name == "xlayer_dispatch":
+                return method(kwargs["x"], kwargs["topk_idx"], kwargs["topk_weights"])
+            if method_name == "xlayer_combine":
+                return method(kwargs["x"], kwargs["handle"])
+            raise
+
+    def _unpack_dispatch_ret(self, ret):
+        if isinstance(ret, tuple):
+            if len(ret) == 6:
+                return ret
+            if len(ret) == 5:
+                recv_x, recv_topk_ids, recv_topk_weights, num_recv_tokens_per_expert, event = (
+                    ret
+                )
+                return (
+                    recv_x,
+                    recv_topk_ids,
+                    recv_topk_weights,
+                    num_recv_tokens_per_expert,
+                    self.handle,
+                    event,
+                )
+        return (
+            ret.recv_x,
+            ret.recv_topk_ids,
+            ret.recv_topk_weights,
+            ret.num_recv_tokens_per_expert,
+            ret.ep_handle,
+            ret.event,
+        )
+
+    def _unpack_combine_ret(self, ret):
+        if isinstance(ret, tuple):
+            if len(ret) >= 2:
+                return ret[0], ret[1]
+            return ret[0], None
+        return ret.combined_x, ret.event
+
+    def _dispatch_core(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        previous_event,
+    ):
+        arrival_tick = self._arrival_tick
+        request_id = f"{self.layer_id}:{arrival_tick}:{self._rank}"
+        self._arrival_tick += 1
+        self._last_request_id = request_id
+        self._expert_slot_infos[(request_id, self.layer_id)] = ExpertSlotInfo(
+            layer_id=self.layer_id,
+            arrival_tick=arrival_tick,
+            request_id=request_id,
+            rank_id=self._rank,
+        )
+        try:
+            self._call_xlayer(
+                "xlayer_dispatch",
+                x=x,
+                topk_idx=topk_ids,
+                topk_weights=topk_weights,
+                request_id=request_id,
+                layer_id=self.layer_id,
+                previous_event=previous_event,
+                async_finish=self.async_finish,
+                do_cpu_sync=False,
+                expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+                config=DeepEPConfig.get_instance().normal_dispatch_config,
+            )
+            self._call_xlayer("xlayer_poll")
+            ret = self._call_xlayer(
+                "xlayer_take_dispatch", request_id=request_id, layer_id=self.layer_id
+            )
+            recv_x, recv_topk_ids, recv_topk_weights, num_recv_tokens_per_expert, handle, event = self._unpack_dispatch_ret(
+                ret
+            )
+            self.handle = handle
+            return (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                event,
+            )
+        except Exception as e:
+            self._warn_and_fallback(e)
+            return super()._dispatch_core(x, topk_ids, topk_weights, previous_event)
+
+    def _combine_core(self, x: torch.Tensor, previous_event):
+        if self._last_request_id is None:
+            return super()._combine_core(x, previous_event)
+        key = (self._last_request_id, self.layer_id)
+        try:
+            partner_expected_bits = self._call_xlayer(
+                "involved_rank_bitmask_for",
+                request_id=self._last_request_id,
+                layer_id=self.layer_id,
+            )
+            aggregator = self._aggregators.get(key)
+            if aggregator is None:
+                aggregator = PartialAggregator(
+                    y_accum=torch.zeros_like(x),
+                    ep_handle=self.handle,
+                    partner_expected_bits=int(partner_expected_bits),
+                )
+                aggregator.mark_dispatch_submitted()
+                self._aggregators[key] = aggregator
+
+            self._call_xlayer(
+                "xlayer_combine",
+                x=x,
+                handle=self.handle,
+                request_id=self._last_request_id,
+                layer_id=self.layer_id,
+                active_partner_bits=int(partner_expected_bits),
+                is_last=False,
+                previous_event=previous_event,
+                async_finish=self.async_finish,
+                allocate_on_comm_stream=previous_event is not None,
+                config=DeepEPConfig.get_instance().normal_combine_config,
+            )
+            self._call_xlayer("xlayer_poll")
+            ret = self._call_xlayer(
+                "xlayer_take_combine",
+                request_id=self._last_request_id,
+                layer_id=self.layer_id,
+            )
+            partial, event = self._unpack_combine_ret(ret)
+            aggregator.add_partial(self._rank, partial)
+            combined = aggregator.y_accum
+            aggregator.release()
+            del self._aggregators[key]
+            return combined, event
+        except Exception as e:
+            self._warn_and_fallback(e)
+            if key in self._aggregators:
+                del self._aggregators[key]
+            return super()._combine_core(x, previous_event)
+
+
 @dataclass
 class _Stage(Enum):
     INITIAL = auto()
@@ -896,3 +1133,41 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+
+class XLayerDeepEPDispatcher(DeepEPDispatcher):
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool = False,
+        num_experts: int = None,
+        num_local_experts: int = None,
+        hidden_size: int = None,
+        params_dtype: torch.dtype = None,
+        deepep_mode: DeepEPMode = DeepEPMode.NORMAL,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+        layer_id: int = 0,
+    ):
+        BaseDispatcher.__init__(self)
+        del return_recv_hook
+        if deepep_mode.enable_low_latency():
+            raise ValueError(
+                "XLayerDeepEPDispatcher currently supports DeepEP normal mode only."
+            )
+        self.deepep_mode = deepep_mode
+        self._normal_dispatcher = _DeepEPDispatcherImplXLayer(
+            layer_id=layer_id,
+            async_finish=async_finish,
+            group=group,
+            router_topk=router_topk,
+            permute_fusion=permute_fusion,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=params_dtype,
+            deepep_mode=deepep_mode,
+        )
+        self._stage = _Stage.INITIAL
+        self._deepep_dispatch_hooks = DeepEPPDispatchHooks()

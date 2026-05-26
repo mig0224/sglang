@@ -156,6 +156,7 @@ TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
+ENABLE_XLAYER_DISPATCHER: Optional[bool] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -171,6 +172,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
+    global ENABLE_XLAYER_DISPATCHER
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -212,6 +214,9 @@ def initialize_moe_config(server_args: ServerArgs):
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
     MOE_QUANTIZATION = server_args.quantization
+    ENABLE_XLAYER_DISPATCHER = bool(
+        getattr(server_args, "enable_xlayer_dispatcher", False)
+    )
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -304,6 +309,13 @@ def get_tbo_token_distribution_threshold() -> float:
         )
         TBO_TOKEN_DISTRIBUTION_THRESHOLD = 0.48
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
+
+
+def is_xlayer_dispatcher_enabled() -> bool:
+    global ENABLE_XLAYER_DISPATCHER
+    if ENABLE_XLAYER_DISPATCHER is None:
+        ENABLE_XLAYER_DISPATCHER = False
+    return ENABLE_XLAYER_DISPATCHER
 
 
 def filter_moe_weight_param_global_expert(name, x, num_local_experts):
