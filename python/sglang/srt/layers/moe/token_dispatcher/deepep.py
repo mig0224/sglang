@@ -824,6 +824,7 @@ class PhaseScheduler:
         return plan[: self.k_c]
 
     def plan_dispatch(self) -> List[Tuple[str, int]]:
+        # D-micro priority follows design: (layer_id, arrival_tick, request_id/rid).
         plan = sorted(
             self._pending_dispatch.keys(),
             key=lambda key: (
@@ -1182,6 +1183,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
 
             event = None
             expected_combine_submissions = max(1, aggregator.expected_partner_count)
+            is_complete = False
             for _ in range(expected_combine_submissions):
                 self._phase_state.enqueue_combine(
                     key=key,
@@ -1221,9 +1223,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 )
                 if is_complete:
                     break
-            else:
-                # Python for-else: this branch runs only if we never hit `break`
-                # (i.e., aggregate never reached completion in the loop above).
+            if not is_complete:
                 raise RuntimeError(
                     f"XLayer combine did not reach completion for key={key} within {expected_combine_submissions} combine submissions"
                 )
