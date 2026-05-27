@@ -171,10 +171,6 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
                 return None
             if method_name == "xlayer_take_combine":
                 return combine_returns[kwargs["slot_idx"]]
-            if method_name == "release_request":
-                self.assertEqual(kwargs["request_id"], impl._last_request_id)
-                self.assertEqual(kwargs["layer_id"], impl.layer_id)
-                return None
             raise AssertionError(f"Unexpected method: {method_name}")
 
         impl._call_xlayer = fake_call_xlayer
@@ -205,13 +201,6 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
         self.assertIn("xlayer_dispatch", method_order)
         self.assertIn(("xlayer_take_combine", {"slot_idx": 21}), call_log)
         self.assertIn(("xlayer_take_combine", {"slot_idx": 22}), call_log)
-        self.assertIn(
-            (
-                "release_request",
-                {"request_id": impl._last_request_id, "layer_id": impl.layer_id},
-            ),
-            call_log,
-        )
 
     def test_configure_xlayer_scheduler_uses_real_signature(self):
         impl = _DeepEPDispatcherImplXLayer.__new__(_DeepEPDispatcherImplXLayer)
