@@ -970,6 +970,8 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         if xlayer_set_config is None:
             return
         config_kwargs = {
+            # Keep enough inflight room for at least one dispatch/combine pair per rank
+            # even before all MoE layers have registered with the shared phase state.
             "num_max_inflight_pairs": max(
                 self._phase_state.num_max_inflight_pairs(),
                 dist.get_world_size(group=self.group) * 2,
@@ -1160,7 +1162,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         try:
             if not self._inline_phase_driving_enabled():
                 raise RuntimeError(
-                    "XLayer inline micro-phase driving is disabled until model-runner integration is available"
+                    "XLayer inline micro-phase driving is disabled by default until model-runner integration enables it"
                 )
             self._phase_state.enqueue_dispatch(
                 key=key,
@@ -1176,7 +1178,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             ret = self._phase_state.take_dispatch_ready(key)
             if ret is None:
                 raise RuntimeError(
-                    f"XLayer dispatch did not produce ready output for key={key} after one inline micro-phase"
+                    f"XLayer dispatch did not produce ready output for key={key} in the first inline micro-phase"
                 )
             (
                 recv_x,
@@ -1207,7 +1209,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         try:
             if not self._inline_phase_driving_enabled():
                 raise RuntimeError(
-                    "XLayer inline micro-phase driving is disabled until model-runner integration is available"
+                    "XLayer inline micro-phase driving is disabled by default until model-runner integration enables it"
                 )
             partner_expected_bits = self._call_xlayer(
                 "involved_rank_bitmask_for",
@@ -1237,7 +1239,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 ret = self._phase_state.take_combine_ready(key)
                 if ret is None:
                     raise RuntimeError(
-                        f"XLayer combine did not produce partial output for key={key} after one inline micro-phase"
+                        f"XLayer combine did not produce partial output for key={key} in the first inline micro-phase"
                     )
                 partial, event, active_partner_bits = self._unpack_combine_ret(ret)
                 is_complete = aggregator.add_partial_bits(

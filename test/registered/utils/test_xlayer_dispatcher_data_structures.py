@@ -97,6 +97,7 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
         impl = _DeepEPDispatcherImplXLayer.__new__(_DeepEPDispatcherImplXLayer)
         impl.layer_id = 4
         impl._arrival_tick = 0
+        # Exercise the inline driver path explicitly; production defaults this off.
         impl._allow_inline_phase_driving = True
         impl._last_request_id = None
         impl._aggregators = {}
