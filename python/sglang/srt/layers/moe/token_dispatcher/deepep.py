@@ -1149,8 +1149,6 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 "release_request", request_id=request_id, layer_id=layer_id
             )
         except Exception as e:
-            if get_bool_env_var("SGLANG_XLAYER_STRICT"):
-                raise
             self._warn_and_fallback(e)
         finally:
             self._expert_slot_infos.pop(key, None)

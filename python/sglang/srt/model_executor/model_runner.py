@@ -3071,13 +3071,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return cached
         dispatchers = []
         for module in self.model.modules():
-            dispatcher = getattr(module, "dispatcher", None)
-            if dispatcher is not None and hasattr(dispatcher, "release_request_all"):
-                dispatchers.append(dispatcher)
+            module_dispatcher = getattr(module, "dispatcher", None)
+            if module_dispatcher is not None and hasattr(
+                module_dispatcher, "release_request_all"
+            ):
+                dispatchers.append(module_dispatcher)
         self._xlayer_dispatchers_cache = dispatchers
         return dispatchers
 
-    def release_xlayer_request_resources(self) -> None:
+    def release_xlayer_request_resources(
+        self, decode_step_counter: Optional[int] = None
+    ) -> None:
+        if decode_step_counter is not None:
+            if (
+                getattr(self, "_last_xlayer_release_step_tag", None)
+                == decode_step_counter
+            ):
+                return
+            self._last_xlayer_release_step_tag = decode_step_counter
         for dispatcher in self._get_xlayer_dispatchers():
             dispatcher.release_request_all()
 
