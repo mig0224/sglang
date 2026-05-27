@@ -65,9 +65,11 @@ class TestXLayerDispatcherDataStructures(unittest.TestCase):
         impl._rank = 0
         impl.async_finish = True
         impl.handle = object()
-        impl._warn_and_fallback = lambda exc: (_ for _ in ()).throw(
-            AssertionError(f"Unexpected fallback: {exc}")
-        )
+
+        def _raise_unexpected_fallback(exc):
+            raise AssertionError(f"Unexpected fallback: {exc}")
+
+        impl._warn_and_fallback = _raise_unexpected_fallback
 
         call_log = []
         poll_slots = [[17], [21], [22]]

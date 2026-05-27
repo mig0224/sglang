@@ -60,6 +60,7 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+_PARTNER_BITS_MASK = (1 << 64) - 1
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -774,7 +775,7 @@ class PartialAggregator:
     state: PartialAggregatorState = PartialAggregatorState.S_INIT
 
     def __post_init__(self):
-        self.partner_expected_bits &= (1 << 64) - 1
+        self.partner_expected_bits &= _PARTNER_BITS_MASK
         self.expected_partner_count = int(self.partner_expected_bits.bit_count())
 
     def mark_dispatch_submitted(self) -> None:
@@ -799,13 +800,13 @@ class PartialAggregator:
     def add_partial_bits(self, active_partner_bits: int, partial_output: torch.Tensor) -> bool:
         self.y_accum.add_(partial_output)
         self.state = PartialAggregatorState.S_AWAITING_PARTIALS
-        masked_bits = int(active_partner_bits) & ((1 << 64) - 1)
+        masked_bits = int(active_partner_bits) & _PARTNER_BITS_MASK
         newly_received_bits = (
             masked_bits & self.partner_expected_bits & (~self.partner_received_bits)
         )
         if newly_received_bits:
             self.partner_received_bits |= newly_received_bits
-            self.received_partner_count += int(newly_received_bits.bit_count())
+            self.received_partner_count += newly_received_bits.bit_count()
         if self.received_partner_count >= self.expected_partner_count:
             self.state = PartialAggregatorState.S_AGGREGATE_COMPLETE
             return True
