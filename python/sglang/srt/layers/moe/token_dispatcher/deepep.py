@@ -1109,6 +1109,44 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 except Exception:
                     pass
 
+    @classmethod
+    def run_micro_phase_driver_all(cls) -> None:
+        """Execute one phase tick on every active XLayer instance.
+
+        This is the **model-runner integration point** for P3: it should be
+        called from a ``DeepEPDispatcher`` dispatch hook (registered by
+        ``XLayerDeepEPDispatcher.__init__``) so that any dispatch/combine
+        payloads that were enqueued in ``_phase_state`` by a previous
+        ``dispatch_a`` call are submitted to the XLayerScheduler (via
+        ``enter_phase`` + ``plan_dispatch`` / ``plan_combine``) before
+        ``dispatch_b`` attempts to read the results.
+
+        In the current *direct poll path* (P3, no ``enter_phase`` per layer)
+        the pending queues will be empty and the method is a no-op.  It
+        becomes meaningful in the *phase-driver path* (P3.5+) where
+        ``_dispatch_core`` enqueues payloads asynchronously.
+
+        The per-instance guard ``_phase_state._pending_dispatch or
+        _phase_state._ffn_ready`` ensures that we only cross the
+        ``enter_phase`` barrier when there is actually work to submit,
+        preventing spurious all-rank synchronisations.
+        """
+        for impl in cls._all_instances:
+            if impl._scheduler is None:
+                continue
+            if not (
+                impl._phase_state._pending_dispatch or impl._phase_state._ffn_ready
+            ):
+                continue
+            try:
+                impl._run_micro_phase_driver()
+            except Exception as exc:
+                logger.debug(
+                    "run_micro_phase_driver_all: skipped instance layer_id=%s: %s",
+                    getattr(impl, "layer_id", "?"),
+                    exc,
+                )
+
     def _warn_and_fallback(self, exc: Exception):
         if not self._warned_fallback:
             logger.warning(
@@ -1608,3 +1646,14 @@ class XLayerDeepEPDispatcher(DeepEPDispatcher):
         )
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
+
+        # Register the phase-driver hook.  This hook fires between
+        # ``dispatch_a`` and ``dispatch_b`` in the model-runner's forward
+        # pass.  In the current *direct poll path* (P3) the pending queues
+        # are always empty, so the call is a no-op with zero overhead.
+        # In the future *phase-driver path* (P3.5+), ``dispatch_a`` will
+        # enqueue payloads asynchronously and this hook will submit them in
+        # one ``enter_phase`` batch before ``dispatch_b`` reads the results.
+        self._deepep_dispatch_hooks.register_hook(
+            lambda _: _DeepEPDispatcherImplXLayer.run_micro_phase_driver_all()
+        )
