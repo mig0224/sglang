@@ -72,6 +72,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 _PARTNER_BITS_MASK = (1 << 64) - 1
+_MAX_DRIVER_SPIN_FACTOR = 16
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -772,6 +773,7 @@ class ExpertSlotInfo:
     layer_id: int
     arrival_tick: int
     request_id: str
+    # Exclude rank_id from ordering to keep cross-rank plan ordering lockstep-safe.
     rank_id: int = field(compare=False)
 
 
@@ -1042,6 +1044,12 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             return [int(ready_slots)]
         return [int(slot_idx) for slot_idx in ready_slots]
 
+    def _max_driver_spins(self) -> int:
+        return (
+            max(8, self._phase_state.k_d + self._phase_state.k_c)
+            * _MAX_DRIVER_SPIN_FACTOR
+        )
+
     def _run_micro_phase_driver(self) -> None:
         self._call_xlayer("enter_phase")
 
@@ -1111,9 +1119,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 },
             )
             ret = None
-            max_driver_spins = (
-                max(8, self._phase_state.k_d + self._phase_state.k_c) * 16
-            )
+            max_driver_spins = self._max_driver_spins()
             for _ in range(max_driver_spins):
                 self._run_micro_phase_driver()
                 ret = self._phase_state.take_dispatch_ready(key)
@@ -1185,9 +1191,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                     },
                 )
                 ret = None
-                max_driver_spins = (
-                    max(8, self._phase_state.k_d + self._phase_state.k_c) * 16
-                )
+                max_driver_spins = self._max_driver_spins()
                 for _ in range(max_driver_spins):
                     self._run_micro_phase_driver()
                     ret = self._phase_state.take_combine_ready(key)
