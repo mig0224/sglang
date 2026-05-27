@@ -97,6 +97,8 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
         impl = _DeepEPDispatcherImplXLayer.__new__(_DeepEPDispatcherImplXLayer)
         impl.layer_id = 4
         impl._arrival_tick = 0
+        # Exercise the inline driver path explicitly; production defaults this off.
+        impl._allow_inline_phase_driving = True
         impl._last_request_id = None
         impl._aggregators = {}
         impl._expert_slot_infos = {}
@@ -135,6 +137,18 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
         def fake_call_xlayer(method_name: str, **kwargs):
             call_log.append((method_name, kwargs))
             if method_name == "xlayer_dispatch":
+                self.assertEqual(
+                    set(kwargs),
+                    {
+                        "x",
+                        "topk_idx",
+                        "topk_weights",
+                        "request_id",
+                        "layer_id",
+                        "num_sms",
+                        "do_cpu_sync",
+                    },
+                )
                 self.assertTrue(torch.equal(kwargs["x"], x))
                 self.assertTrue(torch.equal(kwargs["topk_idx"], topk_ids))
                 self.assertTrue(torch.equal(kwargs["topk_weights"], topk_weights))
@@ -152,7 +166,8 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
                 self.assertEqual(kwargs["layer_id"], impl.layer_id)
                 return expected_bits
             if method_name == "xlayer_combine":
-                self.assertEqual(kwargs["active_partner_bits"], expected_bits)
+                self.assertEqual(set(kwargs), {"x", "handle", "num_sms"})
+                self.assertEqual(kwargs["handle"], impl.handle)
                 return None
             if method_name == "xlayer_take_combine":
                 return combine_returns[kwargs["slot_idx"]]
@@ -165,7 +180,11 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
         dummy_cfg = type(
             "DummyDeepEPConfig",
             (),
-            {"normal_dispatch_config": None, "normal_combine_config": None},
+            {
+                "normal_dispatch_config": None,
+                "normal_combine_config": None,
+                "num_sms": 0,
+            },
         )()
 
         with mock.patch.object(
@@ -182,6 +201,83 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
         self.assertIn("xlayer_dispatch", method_order)
         self.assertIn(("xlayer_take_combine", {"slot_idx": 21}), call_log)
         self.assertIn(("xlayer_take_combine", {"slot_idx": 22}), call_log)
+
+    def test_configure_xlayer_scheduler_uses_real_signature(self):
+        impl = _DeepEPDispatcherImplXLayer.__new__(_DeepEPDispatcherImplXLayer)
+        impl.group = object()
+        impl.router_topk = 2
+        impl.num_experts = 64
+        impl.num_max_dispatch_tokens_per_rank = 256
+        impl._phase_state = PhaseScheduler(k_d=8, k_c=8)
+        impl._phase_state.register_layer(0)
+
+        scheduler = mock.Mock()
+
+        with (
+            mock.patch.object(deepep_mod.dist, "get_world_size", return_value=8),
+            mock.patch.object(
+                deepep_mod.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", False
+            ),
+        ):
+            impl._configure_xlayer_scheduler(scheduler)
+
+        scheduler.xlayer_set_config.assert_called_once_with(
+            num_max_inflight_pairs=16,
+            num_max_tokens_per_rank=256,
+            num_experts=64,
+            num_topk=2,
+            expert_alignment=1,
+        )
+
+    def test_call_xlayer_positional_fallback_preserves_real_api_args(self):
+        impl = _DeepEPDispatcherImplXLayer.__new__(_DeepEPDispatcherImplXLayer)
+
+        class PositionalOnlyScheduler:
+            def xlayer_dispatch(
+                self,
+                x,
+                topk_idx,
+                topk_weights,
+                request_id,
+                layer_id,
+                num_sms=0,
+                do_cpu_sync=False,
+                /,
+            ):
+                return (
+                    x,
+                    topk_idx,
+                    topk_weights,
+                    request_id,
+                    layer_id,
+                    num_sms,
+                    do_cpu_sync,
+                )
+
+            def xlayer_combine(self, x, handle, num_sms=0, /):
+                return x, handle, num_sms
+
+        impl._scheduler = PositionalOnlyScheduler()
+
+        dispatch_ret = impl._call_xlayer(
+            "xlayer_dispatch",
+            x="x",
+            topk_idx="ids",
+            topk_weights="weights",
+            request_id="req-1",
+            layer_id=3,
+            num_sms=7,
+            do_cpu_sync=True,
+        )
+        combine_ret = impl._call_xlayer(
+            "xlayer_combine",
+            x="y",
+            handle="handle-1",
+            num_sms=5,
+        )
+
+        self.assertEqual(dispatch_ret, ("x", "ids", "weights", "req-1", 3, 7, True))
+        self.assertEqual(combine_ret, ("y", "handle-1", 5))
 
 
 if __name__ == "__main__":

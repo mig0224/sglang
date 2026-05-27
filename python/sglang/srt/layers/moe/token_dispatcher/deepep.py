@@ -72,10 +72,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 _PARTNER_BITS_MASK = (1 << 64) - 1
-# Conservative spin cap to avoid infinite loops when no slot becomes ready while
-# still allowing several micro-phase turns before fallback.
-_MAX_DRIVER_SPIN_FACTOR = 16
-_MIN_DRIVER_SPIN_BASE = 8
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -936,6 +932,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         super().__init__(**kwargs)
         self.layer_id = layer_id
         self._arrival_tick = 0
+        self._allow_inline_phase_driving = False
         self._last_request_id: Optional[str] = None
         self._aggregators: Dict[Tuple[str, int], PartialAggregator] = {}
         self._expert_slot_infos: Dict[Tuple[str, int], ExpertSlotInfo] = {}
@@ -972,16 +969,62 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         xlayer_set_config = getattr(scheduler, "xlayer_set_config", None)
         if xlayer_set_config is None:
             return
-        num_max_inflight_pairs = self._phase_state.num_max_inflight_pairs()
+        config_kwargs = {
+            # Keep enough inflight room for at least one dispatch/combine pair per rank
+            # even before all MoE layers have registered with the shared phase state.
+            "num_max_inflight_pairs": max(
+                self._phase_state.num_max_inflight_pairs(),
+                dist.get_world_size(group=self.group) * 2,
+            ),
+            "num_max_tokens_per_rank": self.num_max_dispatch_tokens_per_rank,
+            "num_experts": self.num_experts,
+            "num_topk": self.router_topk,
+            "expert_alignment": (
+                128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+            ),
+        }
         try:
-            xlayer_set_config(num_max_inflight_pairs=num_max_inflight_pairs)
+            xlayer_set_config(**config_kwargs)
         except TypeError:
-            xlayer_set_config(num_max_inflight_pairs)
+            xlayer_set_config(
+                config_kwargs["num_max_inflight_pairs"],
+                config_kwargs["num_max_tokens_per_rank"],
+                config_kwargs["num_experts"],
+                config_kwargs["num_topk"],
+                config_kwargs["expert_alignment"],
+            )
+
+    def _build_xlayer_dispatch_payload(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        request_id: str,
+    ) -> dict:
+        return {
+            "x": x,
+            "topk_idx": topk_ids,
+            "topk_weights": topk_weights,
+            "request_id": request_id,
+            "layer_id": self.layer_id,
+            "num_sms": DeepEPConfig.get_instance().num_sms,
+            "do_cpu_sync": False,
+        }
+
+    def _build_xlayer_combine_payload(self, x: torch.Tensor) -> dict:
+        return {
+            "x": x,
+            "handle": self.handle,
+            "num_sms": DeepEPConfig.get_instance().num_sms,
+        }
+
+    def _inline_phase_driving_enabled(self) -> bool:
+        return self._allow_inline_phase_driving
 
     def _warn_and_fallback(self, exc: Exception):
         if not self._warned_fallback:
             logger.warning(
-                "Falling back to DeepEP normal dispatcher because XLayer scheduler is unavailable: %s",
+                "Falling back to DeepEP normal dispatcher because the XLayer path is unavailable: %s",
                 exc,
             )
             self.__class__._warned_fallback = True
@@ -998,9 +1041,23 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             if method_name in ("xlayer_take_dispatch", "xlayer_take_combine"):
                 return method(kwargs["slot_idx"])
             if method_name == "xlayer_dispatch":
-                return method(kwargs["x"], kwargs["topk_idx"], kwargs["topk_weights"])
+                args = [
+                    kwargs["x"],
+                    kwargs["topk_idx"],
+                    kwargs["topk_weights"],
+                    kwargs["request_id"],
+                    kwargs["layer_id"],
+                ]
+                if "num_sms" in kwargs:
+                    args.append(kwargs["num_sms"])
+                if "do_cpu_sync" in kwargs:
+                    args.append(kwargs["do_cpu_sync"])
+                return method(*args)
             if method_name == "xlayer_combine":
-                return method(kwargs["x"], kwargs["handle"])
+                args = [kwargs["x"], kwargs["handle"]]
+                if "num_sms" in kwargs:
+                    args.append(kwargs["num_sms"])
+                return method(*args)
             raise
 
     def _unpack_dispatch_ret(self, ret):
@@ -1053,13 +1110,6 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             return [int(ready_slots)]
         return [int(slot_idx) for slot_idx in ready_slots]
 
-    def _max_driver_spins(self) -> int:
-        # Minimum base of 8 allows a few lockstep phase turns even with tiny k_d/k_c.
-        return (
-            max(_MIN_DRIVER_SPIN_BASE, self._phase_state.k_d + self._phase_state.k_c)
-            * _MAX_DRIVER_SPIN_FACTOR
-        )
-
     def _run_micro_phase_driver(self) -> None:
         self._call_xlayer("enter_phase")
 
@@ -1110,34 +1160,25 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         )
         self._expert_slot_infos[key] = slot_info
         try:
+            if not self._inline_phase_driving_enabled():
+                raise RuntimeError(
+                    "XLayer inline micro-phase driving is disabled by default until model-runner integration enables it"
+                )
             self._phase_state.enqueue_dispatch(
                 key=key,
                 slot_info=slot_info,
-                payload={
-                    "x": x,
-                    "topk_idx": topk_ids,
-                    "topk_weights": topk_weights,
-                    "request_id": request_id,
-                    "layer_id": self.layer_id,
-                    "previous_event": previous_event,
-                    "async_finish": self.async_finish,
-                    "do_cpu_sync": False,
-                    "expert_alignment": (
-                        128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
-                    ),
-                    "config": DeepEPConfig.get_instance().normal_dispatch_config,
-                },
+                payload=self._build_xlayer_dispatch_payload(
+                    x=x,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    request_id=request_id,
+                ),
             )
-            ret = None
-            max_driver_spins = self._max_driver_spins()
-            for _ in range(max_driver_spins):
-                self._run_micro_phase_driver()
-                ret = self._phase_state.take_dispatch_ready(key)
-                if ret is not None:
-                    break
+            self._run_micro_phase_driver()
+            ret = self._phase_state.take_dispatch_ready(key)
             if ret is None:
                 raise RuntimeError(
-                    f"XLayer dispatch did not produce ready output for key={key} after {max_driver_spins} micro-phases"
+                    f"XLayer dispatch did not produce ready output for key={key} in the first inline micro-phase"
                 )
             (
                 recv_x,
@@ -1166,6 +1207,10 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             return super()._combine_core(x, previous_event)
         key = (self._last_request_id, self.layer_id)
         try:
+            if not self._inline_phase_driving_enabled():
+                raise RuntimeError(
+                    "XLayer inline micro-phase driving is disabled by default until model-runner integration enables it"
+                )
             partner_expected_bits = self._call_xlayer(
                 "involved_rank_bitmask_for",
                 request_id=self._last_request_id,
@@ -1188,29 +1233,13 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 self._phase_state.enqueue_combine(
                     key=key,
                     slot_info=self._expert_slot_infos[key],
-                    payload={
-                        "x": x,
-                        "handle": self.handle,
-                        "request_id": self._last_request_id,
-                        "layer_id": self.layer_id,
-                        "active_partner_bits": int(partner_expected_bits),
-                        "is_last": False,
-                        "previous_event": previous_event,
-                        "async_finish": self.async_finish,
-                        "allocate_on_comm_stream": previous_event is not None,
-                        "config": DeepEPConfig.get_instance().normal_combine_config,
-                    },
+                    payload=self._build_xlayer_combine_payload(x),
                 )
-                ret = None
-                max_driver_spins = self._max_driver_spins()
-                for _ in range(max_driver_spins):
-                    self._run_micro_phase_driver()
-                    ret = self._phase_state.take_combine_ready(key)
-                    if ret is not None:
-                        break
+                self._run_micro_phase_driver()
+                ret = self._phase_state.take_combine_ready(key)
                 if ret is None:
                     raise RuntimeError(
-                        f"XLayer combine did not produce partial output for key={key} after {max_driver_spins} micro-phases"
+                        f"XLayer combine did not produce partial output for key={key} in the first inline micro-phase"
                     )
                 partial, event, active_partner_bits = self._unpack_combine_ret(ret)
                 is_complete = aggregator.add_partial_bits(
