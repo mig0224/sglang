@@ -573,6 +573,7 @@ class SchedulerOutputProcessorMixin:
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
+            self.tp_worker.model_runner.release_xlayer_request_resources()
 
         self.maybe_collect_customized_info(i, req, logits_output)
 

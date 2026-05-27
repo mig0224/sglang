@@ -3065,6 +3065,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+    def _get_xlayer_dispatchers(self) -> List[object]:
+        cached = getattr(self, "_xlayer_dispatchers_cache", None)
+        if cached is not None:
+            return cached
+        dispatchers = []
+        for module in self.model.modules():
+            dispatcher = getattr(module, "dispatcher", None)
+            if dispatcher is not None and hasattr(dispatcher, "release_request_all"):
+                dispatchers.append(dispatcher)
+        self._xlayer_dispatchers_cache = dispatchers
+        return dispatchers
+
+    def release_xlayer_request_resources(self) -> None:
+        for dispatcher in self._get_xlayer_dispatchers():
+            dispatcher.release_request_all()
+
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):
