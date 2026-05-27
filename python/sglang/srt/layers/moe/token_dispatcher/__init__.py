@@ -11,11 +11,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
     DeepEPDispatcher,
-    ExpertSlotInfo,
     DeepEPLLCombineInput,
     DeepEPLLDispatchOutput,
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
+    ExpertSlotInfo,
     PartialAggregator,
     PartialAggregatorState,
     XLayerDeepEPDispatcher,

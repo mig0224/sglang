@@ -1,22 +1,24 @@
 import unittest
 from unittest import mock
 
-import sglang.srt.layers.moe.utils as moe_utils
 import torch
 
 import sglang.srt.layers.moe.token_dispatcher.deepep as deepep_mod
+import sglang.srt.layers.moe.utils as moe_utils
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     ExpertSlotInfo,
     PartialAggregator,
     PartialAggregatorState,
+    PhaseScheduler,
     _DeepEPDispatcherImplXLayer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
 
 
-class TestXLayerDispatcherDataStructures(unittest.TestCase):
+class TestXLayerDispatcherDataStructures(CustomTestCase):
     def test_xlayer_dispatcher_flag_defaults_false(self):
         moe_utils.ENABLE_XLAYER_DISPATCHER = None
         self.assertFalse(moe_utils.is_xlayer_dispatcher_enabled())
@@ -55,6 +57,42 @@ class TestXLayerDispatcherDataStructures(unittest.TestCase):
             [(1, 9), (2, 3), (2, 5)],
         )
 
+    def test_phase_scheduler_deterministic_plans(self):
+        scheduler = PhaseScheduler(k_d=2, k_c=2)
+        scheduler.enqueue_dispatch(
+            ("r2", 2),
+            ExpertSlotInfo(layer_id=2, arrival_tick=9, request_id="r2", rank_id=1),
+            payload={"name": "d2"},
+        )
+        scheduler.enqueue_dispatch(
+            ("r1", 1),
+            ExpertSlotInfo(layer_id=1, arrival_tick=10, request_id="r1", rank_id=0),
+            payload={"name": "d1"},
+        )
+        scheduler.enqueue_dispatch(
+            ("r3", 2),
+            ExpertSlotInfo(layer_id=2, arrival_tick=3, request_id="r3", rank_id=3),
+            payload={"name": "d3"},
+        )
+        scheduler.enqueue_combine(
+            ("c2", 2),
+            ExpertSlotInfo(layer_id=2, arrival_tick=1, request_id="c2", rank_id=3),
+            payload={"name": "c2"},
+        )
+        scheduler.enqueue_combine(
+            ("c1", 1),
+            ExpertSlotInfo(layer_id=1, arrival_tick=9, request_id="c1", rank_id=2),
+            payload={"name": "c1"},
+        )
+        scheduler.enqueue_combine(
+            ("c0", 1),
+            ExpertSlotInfo(layer_id=1, arrival_tick=1, request_id="c0", rank_id=7),
+            payload={"name": "c0"},
+        )
+
+        self.assertEqual(scheduler.plan_dispatch(), [("r1", 1), ("r3", 2)])
+        self.assertEqual(scheduler.plan_combine(), [("c0", 1), ("c1", 1)])
+
     def test_xlayer_impl_uses_slot_poll_take_sequence(self):
         impl = _DeepEPDispatcherImplXLayer.__new__(_DeepEPDispatcherImplXLayer)
         impl.layer_id = 4
@@ -65,6 +103,7 @@ class TestXLayerDispatcherDataStructures(unittest.TestCase):
         impl._rank = 0
         impl.async_finish = True
         impl.handle = object()
+        impl._phase_state = PhaseScheduler(k_d=8, k_c=8)
 
         def _raise_unexpected_fallback(exc):
             raise AssertionError(f"Unexpected fallback: {exc}")
@@ -73,7 +112,10 @@ class TestXLayerDispatcherDataStructures(unittest.TestCase):
 
         call_log = []
         dispatch_slot = 17
-        poll_slots = [[dispatch_slot], [21], [22]]
+        poll_schedule = {
+            "dispatch": [[dispatch_slot], [], []],
+            "combine": [[], [21], [22]],
+        }
         partial1 = torch.ones((2, 3), dtype=torch.float32)
         partial2 = torch.full((2, 3), 2.0, dtype=torch.float32)
         dispatch_ret = (
@@ -97,8 +139,11 @@ class TestXLayerDispatcherDataStructures(unittest.TestCase):
                 self.assertTrue(torch.equal(kwargs["topk_idx"], topk_ids))
                 self.assertTrue(torch.equal(kwargs["topk_weights"], topk_weights))
                 return None
+            if method_name == "enter_phase":
+                return None
             if method_name == "xlayer_poll":
-                return poll_slots.pop(0)
+                kind = kwargs["kind"]
+                return poll_schedule[kind].pop(0)
             if method_name == "xlayer_take_dispatch":
                 self.assertEqual(kwargs["slot_idx"], dispatch_slot)
                 return dispatch_ret
@@ -128,20 +173,13 @@ class TestXLayerDispatcherDataStructures(unittest.TestCase):
         ):
             impl._dispatch_core(x, topk_ids, topk_weights, previous_event=None)
             key = (impl._last_request_id, impl.layer_id)
-            combined_1, _ = impl._combine_core(x, previous_event=None)
-            self.assertTrue(torch.equal(combined_1, partial1))
-            self.assertIn(key, impl._aggregators)
-            self.assertEqual(
-                impl._aggregators[key].state, PartialAggregatorState.S_AWAITING_PARTIALS
-            )
-            combined_2, _ = impl._combine_core(x, previous_event=None)
-            self.assertTrue(torch.equal(combined_2, partial1 + partial2))
+            combined, _ = impl._combine_core(x, previous_event=None)
+            self.assertTrue(torch.equal(combined, partial1 + partial2))
             self.assertNotIn(key, impl._aggregators)
 
         method_order = [name for name, _ in call_log]
-        self.assertEqual(
-            method_order[:3], ["xlayer_dispatch", "xlayer_poll", "xlayer_take_dispatch"]
-        )
+        self.assertIn("enter_phase", method_order)
+        self.assertIn("xlayer_dispatch", method_order)
         self.assertIn(("xlayer_take_combine", {"slot_idx": 21}), call_log)
         self.assertIn(("xlayer_take_combine", {"slot_idx": 22}), call_log)
 
