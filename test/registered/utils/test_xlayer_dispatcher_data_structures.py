@@ -283,6 +283,92 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
         self.assertEqual(dispatch_ret, ("x", "ids", "weights", "req-1", 3, 7, True))
         self.assertEqual(combine_ret, ("y", "handle-1", 5))
 
+    def test_xlayer_dispatcher_flag_env_var_fallback(self):
+        # When ENABLE_XLAYER_DISPATCHER is None the helper should fall back to
+        # the SGLANG_XLAYER_DISPATCHER environment variable.
+        moe_utils.ENABLE_XLAYER_DISPATCHER = None
+        with mock.patch.dict("os.environ", {"SGLANG_XLAYER_DISPATCHER": "1"}):
+            self.assertTrue(moe_utils.is_xlayer_dispatcher_enabled())
+        with mock.patch.dict("os.environ", {"SGLANG_XLAYER_DISPATCHER": "true"}):
+            self.assertTrue(moe_utils.is_xlayer_dispatcher_enabled())
+        with mock.patch.dict("os.environ", {"SGLANG_XLAYER_DISPATCHER": "yes"}):
+            self.assertTrue(moe_utils.is_xlayer_dispatcher_enabled())
+        with mock.patch.dict("os.environ", {"SGLANG_XLAYER_DISPATCHER": "0"}):
+            self.assertFalse(moe_utils.is_xlayer_dispatcher_enabled())
+        # Explicit Python-level flag overrides the env var entirely.
+        moe_utils.ENABLE_XLAYER_DISPATCHER = True
+        with mock.patch.dict("os.environ", {"SGLANG_XLAYER_DISPATCHER": "0"}):
+            self.assertTrue(moe_utils.is_xlayer_dispatcher_enabled())
+        moe_utils.ENABLE_XLAYER_DISPATCHER = None  # restore
+
+    def test_run_micro_phase_driver_all_skips_empty_queues(self):
+        # run_micro_phase_driver_all should not attempt to call _run_micro_phase_driver
+        # on any instance whose pending queues are empty.
+        original = list(_DeepEPDispatcherImplXLayer._all_instances)
+        _DeepEPDispatcherImplXLayer._all_instances.clear()
+        try:
+            driver_calls = []
+
+            class _FakeImpl:
+                _scheduler = object()  # non-None → not skipped by None-check
+                _phase_state = PhaseScheduler(k_d=2, k_c=2)
+
+                def _run_micro_phase_driver(self):
+                    driver_calls.append(id(self))
+
+            impl_empty = _FakeImpl()
+            impl_with_work = _FakeImpl()
+            # Only impl_with_work has pending dispatch.
+            impl_with_work._phase_state.enqueue_dispatch(
+                ("r1", 0),
+                ExpertSlotInfo(
+                    layer_id=0, arrival_tick=0, request_id="r1", rank_id=0
+                ),
+                {"name": "d"},
+            )
+
+            _DeepEPDispatcherImplXLayer._all_instances.extend(
+                [impl_empty, impl_with_work]
+            )
+            _DeepEPDispatcherImplXLayer.run_micro_phase_driver_all()
+
+            # Only the instance with queued work should have been driven.
+            self.assertNotIn(id(impl_empty), driver_calls)
+            self.assertIn(id(impl_with_work), driver_calls)
+        finally:
+            _DeepEPDispatcherImplXLayer._all_instances.clear()
+            _DeepEPDispatcherImplXLayer._all_instances.extend(original)
+
+    def test_run_micro_phase_driver_all_skips_no_scheduler(self):
+        # Instances with _scheduler=None must be silently skipped.
+        original = list(_DeepEPDispatcherImplXLayer._all_instances)
+        _DeepEPDispatcherImplXLayer._all_instances.clear()
+        try:
+            driver_calls = []
+
+            class _FakeImplNoScheduler:
+                _scheduler = None
+                _phase_state = PhaseScheduler(k_d=2, k_c=2)
+
+                def _run_micro_phase_driver(self):
+                    driver_calls.append(id(self))
+
+            impl = _FakeImplNoScheduler()
+            impl._phase_state.enqueue_dispatch(
+                ("r2", 0),
+                ExpertSlotInfo(
+                    layer_id=0, arrival_tick=0, request_id="r2", rank_id=0
+                ),
+                {},
+            )
+            _DeepEPDispatcherImplXLayer._all_instances.append(impl)
+            # Should not raise and should not call _run_micro_phase_driver.
+            _DeepEPDispatcherImplXLayer.run_micro_phase_driver_all()
+            self.assertEqual(driver_calls, [])
+        finally:
+            _DeepEPDispatcherImplXLayer._all_instances.clear()
+            _DeepEPDispatcherImplXLayer._all_instances.extend(original)
+
 
 if __name__ == "__main__":
     unittest.main()

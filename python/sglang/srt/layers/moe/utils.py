@@ -312,7 +312,9 @@ def get_tbo_token_distribution_threshold() -> float:
 
 
 def is_xlayer_dispatcher_enabled() -> bool:
-    return bool(ENABLE_XLAYER_DISPATCHER)
+    if ENABLE_XLAYER_DISPATCHER is not None:
+        return bool(ENABLE_XLAYER_DISPATCHER)
+    return os.environ.get("SGLANG_XLAYER_DISPATCHER", "0").lower() in ("1", "true", "yes")
 
 
 def filter_moe_weight_param_global_expert(name, x, num_local_experts):
