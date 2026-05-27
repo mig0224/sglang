@@ -72,6 +72,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 _PARTNER_BITS_MASK = (1 << 64) - 1
+# Conservative spin cap to avoid infinite loops when no slot becomes ready while
+# still allowing several micro-phase turns before fallback.
 _MAX_DRIVER_SPIN_FACTOR = 16
 
 
@@ -805,6 +807,7 @@ class PhaseScheduler:
         self._ffn_ready[key] = (slot_info, payload)
 
     def plan_combine(self) -> List[Tuple[str, int]]:
+        # C-micro priority follows design: (layer_id, request_id/rid, arrival_tick).
         plan = sorted(
             self._ffn_ready.keys(),
             key=lambda key: (
@@ -921,7 +924,7 @@ class PartialAggregator:
 
 class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
     _warned_fallback = False
-    _phase_scheduler: Optional[PhaseScheduler] = None
+    _shared_phase_scheduler: Optional[PhaseScheduler] = None
 
     def __init__(self, layer_id: int, **kwargs):
         super().__init__(**kwargs)
@@ -936,12 +939,12 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         self._scheduler = self._init_scheduler()
 
     def _get_phase_scheduler(self) -> PhaseScheduler:
-        if self.__class__._phase_scheduler is None:
+        if self.__class__._shared_phase_scheduler is None:
             world_size = dist.get_world_size(group=self.group)
-            self.__class__._phase_scheduler = PhaseScheduler(
+            self.__class__._shared_phase_scheduler = PhaseScheduler(
                 k_d=world_size, k_c=world_size
             )
-        phase_state = self.__class__._phase_scheduler
+        phase_state = self.__class__._shared_phase_scheduler
         phase_state.register_layer(self.layer_id)
         return phase_state
 
@@ -1045,6 +1048,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         return [int(slot_idx) for slot_idx in ready_slots]
 
     def _max_driver_spins(self) -> int:
+        # Minimum base of 8 allows a few lockstep phase turns even with tiny k_d/k_c.
         return (
             max(8, self._phase_state.k_d + self._phase_state.k_c)
             * _MAX_DRIVER_SPIN_FACTOR
@@ -1213,6 +1217,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 if is_complete:
                     break
             else:
+                # Timed out waiting for all expected partners within this combine loop.
                 raise RuntimeError(
                     f"XLayer combine did not reach completion for key={key} within {num_partner_steps} micro-phases"
                 )
