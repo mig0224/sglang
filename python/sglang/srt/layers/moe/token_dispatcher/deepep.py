@@ -1021,6 +1021,9 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
     def _inline_phase_driving_enabled(self) -> bool:
         return self._allow_inline_phase_driving
 
+    def set_inline_phase_driving(self, enabled: bool) -> None:
+        self._allow_inline_phase_driving = bool(enabled)
+
     def _warn_and_fallback(self, exc: Exception):
         if not self._warned_fallback:
             logger.warning(
@@ -1138,6 +1141,21 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             self._phase_state.mark_combine_ready(ret)
 
         self._phase_state.advance_phase()
+
+    def _release_request_key(self, key: Tuple[str, int]) -> None:
+        request_id, layer_id = key
+        try:
+            self._call_xlayer(
+                "release_request", request_id=request_id, layer_id=layer_id
+            )
+        except Exception as e:
+            self._warn_and_fallback(e)
+        finally:
+            self._expert_slot_infos.pop(key, None)
+
+    def release_request_all(self) -> None:
+        for key in list(self._expert_slot_infos.keys()):
+            self._release_request_key(key)
 
     def _dispatch_core(
         self,
@@ -1260,6 +1278,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             combined = aggregator.y_accum
             aggregator.release()
             del self._aggregators[key]
+            self._release_request_key(key)
             return combined, event
         except Exception as e:
             if get_bool_env_var("SGLANG_XLAYER_STRICT"):
@@ -1267,6 +1286,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             self._warn_and_fallback(e)
             if key in self._aggregators:
                 del self._aggregators[key]
+            self._expert_slot_infos.pop(key, None)
             return super()._combine_core(x, previous_event)
 
 
@@ -1458,3 +1478,9 @@ class XLayerDeepEPDispatcher(DeepEPDispatcher):
         )
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
+
+    def enable_inline_phase_driving(self, enabled: bool = True) -> None:
+        self._normal_dispatcher.set_inline_phase_driving(enabled)
+
+    def release_request_all(self) -> None:
+        self._normal_dispatcher.release_request_all()
