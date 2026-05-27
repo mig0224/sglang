@@ -75,6 +75,7 @@ _PARTNER_BITS_MASK = (1 << 64) - 1
 # Conservative spin cap to avoid infinite loops when no slot becomes ready while
 # still allowing several micro-phase turns before fallback.
 _MAX_DRIVER_SPIN_FACTOR = 16
+_MIN_DRIVER_SPIN_BASE = 8
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -772,6 +773,7 @@ class PartialAggregatorState(Enum):
 
 @dataclass(order=True)
 class ExpertSlotInfo:
+    # Ordering key used by phase planning: layer first, then per-layer arrival/request.
     layer_id: int
     arrival_tick: int
     request_id: str
@@ -1053,7 +1055,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
     def _max_driver_spins(self) -> int:
         # Minimum base of 8 allows a few lockstep phase turns even with tiny k_d/k_c.
         return (
-            max(8, self._phase_state.k_d + self._phase_state.k_c)
+            max(_MIN_DRIVER_SPIN_BASE, self._phase_state.k_d + self._phase_state.k_c)
             * _MAX_DRIVER_SPIN_FACTOR
         )
 
@@ -1220,7 +1222,8 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 if is_complete:
                     break
             else:
-                # Timed out waiting for all expected partners within this combine loop.
+                # Python for-else: this branch runs only if we never hit `break`
+                # (i.e., aggregate never reached completion in the loop above).
                 raise RuntimeError(
                     f"XLayer combine did not reach completion for key={key} within {expected_combine_submissions} combine submissions"
                 )
