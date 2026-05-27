@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from contextlib import nullcontext
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from enum import Enum, IntEnum, auto
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Deque,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -41,6 +55,7 @@ if TYPE_CHECKING:
 
 try:
     from deep_ep import Buffer, Config
+    from deep_ep.buffers.xlayers import XLayerScheduler
 
     if not _is_npu:
         from sglang.srt.layers.quantization.fp8_kernel import (
@@ -50,8 +65,7 @@ try:
     use_deepep = True
 except ImportError:
     use_deepep = False
-
-from enum import Enum, IntEnum, auto
+    XLayerScheduler = None
 
 import torch
 import torch.distributed as dist
@@ -59,6 +73,26 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+_PARTNER_BITS_MASK = (1 << 64) - 1
+
+# Busy-poll limit for xlayer_poll. At ~1 μs/iteration this is ~50 ms, well
+# within NVLink latency bounds on a single H20 node.
+_XLAYER_POLL_MAX_ITERS = 50_000
+
+
+class _NoopEvent:
+    """Drop-in event returned from the XLayer path.
+
+    ``XLayerScheduler.xlayer_take_*`` already calls
+    ``overlap.current_stream_wait()`` internally, so there is nothing left to
+    wait for at the dispatcher level.
+    """
+
+    def current_stream_wait(self) -> None:
+        return None
+
+    def query(self) -> bool:
+        return True
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -746,6 +780,684 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
+class PartialAggregatorState(Enum):
+    S_INIT = auto()
+    S_DISPATCH_SUBMITTED = auto()
+    S_AWAITING_PARTIALS = auto()
+    S_AGGREGATE_COMPLETE = auto()
+    S_RELEASED = auto()
+
+
+@dataclass(order=True)
+class ExpertSlotInfo:
+    # Ordering key used by phase planning: layer first, then per-layer arrival/request.
+    layer_id: int
+    arrival_tick: int
+    request_id: str
+    # Exclude rank_id from ordering to keep cross-rank plan ordering lockstep-safe.
+    rank_id: int = field(compare=False)
+
+
+class PhaseScheduler:
+    # Keyed by id(group) so different EP process-groups each get their own
+    # scheduler instance.  Fixes the class-level singleton isolation bug.
+    _instances: ClassVar[Dict[int, "PhaseScheduler"]] = {}
+
+    def __init__(self, k_d: int, k_c: int):
+        self.k_d = max(1, int(k_d))
+        self.k_c = max(1, int(k_c))
+        self.phase_id = 0
+        self.max_seen_layer_id = -1
+        self._pending_dispatch: Dict[Tuple[str, int], Tuple[ExpertSlotInfo, dict]] = {}
+        self._ffn_ready: Dict[Tuple[str, int], Tuple[ExpertSlotInfo, dict]] = {}
+        # Maps (request_id, layer_id) → raw xlayer_take_dispatch return when ready.
+        self._dispatch_ready: Dict[Tuple[str, int], Any] = {}
+        # Maps (request_id, layer_id) → list of raw xlayer_take_combine returns.
+        self._combine_ready: Dict[Tuple[str, int], List[Any]] = {}
+
+    @classmethod
+    def get_or_create(cls, group, layer_id: int) -> "PhaseScheduler":
+        group_key = id(group)
+        if group_key not in cls._instances:
+            world_size = dist.get_world_size(group=group)
+            cls._instances[group_key] = cls(k_d=world_size, k_c=world_size)
+        inst = cls._instances[group_key]
+        inst.register_layer(layer_id)
+        return inst
+
+    def register_layer(self, layer_id: int) -> int:
+        self.max_seen_layer_id = max(self.max_seen_layer_id, int(layer_id))
+        return self.num_max_inflight_pairs()
+
+    def num_max_inflight_pairs(self) -> int:
+        return max(1, (self.max_seen_layer_id + 1) * 2)
+
+    def enqueue_dispatch(
+        self, key: Tuple[str, int], slot_info: ExpertSlotInfo, payload: dict
+    ) -> None:
+        self._pending_dispatch[key] = (slot_info, payload)
+
+    def enqueue_combine(
+        self, key: Tuple[str, int], slot_info: ExpertSlotInfo, payload: dict
+    ) -> None:
+        self._ffn_ready[key] = (slot_info, payload)
+
+    def plan_combine(self) -> List[Tuple[str, int]]:
+        # C-micro priority follows design: (layer_id, request_id/rid, arrival_tick).
+        plan = sorted(
+            self._ffn_ready.keys(),
+            key=lambda key: (
+                self._ffn_ready[key][0].layer_id,
+                self._ffn_ready[key][0].request_id,
+                self._ffn_ready[key][0].arrival_tick,
+            ),
+        )
+        return plan[: self.k_c]
+
+    def plan_dispatch(self) -> List[Tuple[str, int]]:
+        # D-micro priority follows design: (layer_id, arrival_tick, request_id/rid).
+        plan = sorted(
+            self._pending_dispatch.keys(),
+            key=lambda key: (
+                self._pending_dispatch[key][0].layer_id,
+                self._pending_dispatch[key][0].arrival_tick,
+                self._pending_dispatch[key][0].request_id,
+            ),
+        )
+        return plan[: self.k_d]
+
+    def pop_dispatch_payload(self, key: Tuple[str, int]) -> dict:
+        _, payload = self._pending_dispatch.pop(key)
+        return payload
+
+    def pop_combine_payload(self, key: Tuple[str, int]) -> dict:
+        _, payload = self._ffn_ready.pop(key)
+        return payload
+
+    def mark_dispatch_ready(self, key: Tuple[str, int], ret: Any) -> None:
+        """Record a completed dispatch result keyed by (rid, layer_id).
+
+        Unlike the old FIFO approach, callers must pass the explicit key so
+        that out-of-order completions (possible when K_d > 1) map correctly.
+        """
+        self._dispatch_ready[key] = ret
+
+    def mark_combine_ready(self, key: Tuple[str, int], ret: Any) -> None:
+        """Append a completed combine partial keyed by (rid, layer_id)."""
+        self._combine_ready.setdefault(key, []).append(ret)
+
+    def take_dispatch_ready(self, key: Tuple[str, int]) -> Optional[Any]:
+        return self._dispatch_ready.pop(key, None)
+
+    def take_combine_ready(self, key: Tuple[str, int]) -> Optional[Any]:
+        ready = self._combine_ready.get(key)
+        if not ready:
+            return None
+        ret = ready.pop(0)
+        if not ready:
+            del self._combine_ready[key]
+        return ret
+
+    def advance_phase(self) -> None:
+        self.phase_id += 1
+
+
+@dataclass
+class PartialAggregator:
+    y_accum: torch.Tensor
+    ep_handle: Any
+    partner_expected_bits: int
+    partner_received_bits: int = 0
+    expected_partner_count: int = 0
+    received_partner_count: int = 0
+    state: PartialAggregatorState = PartialAggregatorState.S_INIT
+
+    def __post_init__(self):
+        self.partner_expected_bits &= _PARTNER_BITS_MASK
+        self.expected_partner_count = int(self.partner_expected_bits.bit_count())
+
+    def mark_dispatch_submitted(self) -> None:
+        self.state = PartialAggregatorState.S_DISPATCH_SUBMITTED
+
+    def add_partial(self, partner_rank: int, partial_output: torch.Tensor) -> bool:
+        self.y_accum.add_(partial_output)
+        self.state = PartialAggregatorState.S_AWAITING_PARTIALS
+        if 0 <= partner_rank < 64:
+            partner_bit = 1 << partner_rank
+            if (self.partner_expected_bits & partner_bit) != 0 and (
+                self.partner_received_bits & partner_bit
+            ) == 0:
+                self.partner_received_bits |= partner_bit
+                self.received_partner_count += 1
+        if self.received_partner_count >= self.expected_partner_count:
+            self.state = PartialAggregatorState.S_AGGREGATE_COMPLETE
+            return True
+        return False
+
+    def add_partial_bits(
+        self, active_partner_bits: int, partial_output: torch.Tensor
+    ) -> bool:
+        self.y_accum.add_(partial_output)
+        self.state = PartialAggregatorState.S_AWAITING_PARTIALS
+        masked_bits = int(active_partner_bits) & _PARTNER_BITS_MASK
+        newly_received_bits = (
+            masked_bits & self.partner_expected_bits & (~self.partner_received_bits)
+        )
+        if newly_received_bits:
+            self.partner_received_bits |= newly_received_bits
+            self.received_partner_count += newly_received_bits.bit_count()
+        if self.received_partner_count >= self.expected_partner_count:
+            self.state = PartialAggregatorState.S_AGGREGATE_COMPLETE
+            return True
+        return False
+
+    def release(self) -> None:
+        self.state = PartialAggregatorState.S_RELEASED
+
+
+class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
+    _warned_fallback: ClassVar[bool] = False
+    # registry for release_request — populated in __init__
+    _all_instances: ClassVar[List["_DeepEPDispatcherImplXLayer"]] = []
+
+    def __init__(self, layer_id: int, **kwargs):
+        super().__init__(**kwargs)
+        self.layer_id = layer_id
+        self._arrival_tick = 0
+        self._last_request_id: Optional[str] = None
+        self._aggregators: Dict[Tuple[str, int], PartialAggregator] = {}
+        self._expert_slot_infos: Dict[Tuple[str, int], ExpertSlotInfo] = {}
+        self._rank = dist.get_rank(group=self.group)
+        self._num_ranks = dist.get_world_size(group=self.group)
+        self._buffer = self._get_buffer()
+        self._phase_state = PhaseScheduler.get_or_create(self.group, self.layer_id)
+        self._scheduler = self._init_scheduler()
+        self.__class__._all_instances.append(self)
+
+    # ------------------------------------------------------------------
+    # Scheduler init / config
+    # ------------------------------------------------------------------
+
+    def _init_scheduler(self):
+        if XLayerScheduler is None:
+            return None
+        try:
+            scheduler = XLayerScheduler(self._buffer)
+            self._configure_xlayer_scheduler(scheduler)
+            return scheduler
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize XLayerScheduler (XLayer path will fall back to DeepEP): %s",
+                e,
+            )
+            return None
+
+    def _configure_xlayer_scheduler(self, scheduler: Any) -> None:
+        xlayer_set_config = getattr(scheduler, "xlayer_set_config", None)
+        if xlayer_set_config is None:
+            return
+        config_kwargs = {
+            # Keep enough inflight room for at least one dispatch/combine pair per rank
+            # even before all MoE layers have registered with the shared phase state.
+            "num_max_inflight_pairs": max(
+                self._phase_state.num_max_inflight_pairs(),
+                dist.get_world_size(group=self.group) * 2,
+            ),
+            "num_max_tokens_per_rank": self.num_max_dispatch_tokens_per_rank,
+            "num_experts": self.num_experts,
+            "num_topk": self.router_topk,
+            "expert_alignment": (
+                128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+            ),
+        }
+        try:
+            xlayer_set_config(**config_kwargs)
+        except TypeError:
+            xlayer_set_config(
+                config_kwargs["num_max_inflight_pairs"],
+                config_kwargs["num_max_tokens_per_rank"],
+                config_kwargs["num_experts"],
+                config_kwargs["num_topk"],
+                config_kwargs["expert_alignment"],
+            )
+
+    def _build_xlayer_dispatch_payload(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        request_id: str,
+    ) -> dict:
+        return {
+            "x": x,
+            "topk_idx": topk_ids,
+            "topk_weights": topk_weights,
+            "request_id": request_id,
+            "layer_id": self.layer_id,
+            "num_sms": DeepEPConfig.get_instance().num_sms,
+            "do_cpu_sync": False,
+        }
+
+    def _build_xlayer_combine_payload(self, x: torch.Tensor) -> dict:
+        return {
+            "x": x,
+            "handle": self.handle,
+            "num_sms": DeepEPConfig.get_instance().num_sms,
+        }
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_batch_request_id(self) -> str:
+        """Return a cross-rank-deterministic batch-level request ID.
+
+        When ``ForwardBatch.rids`` is available (non-CUDA-graph eager path),
+        we derive the ID from the lexicographically smallest rid so all EP ranks
+        agree (they all see the same batch of tokens).  Falls back to the
+        tick-based ID which is always deterministic.
+        """
+        ctx = get_forward_context()
+        if ctx is not None and ctx.forward_batch is not None:
+            rids = getattr(ctx.forward_batch, "rids", None)
+            if rids:
+                return f"L{self.layer_id}:{min(rids)}"
+        return f"L{self.layer_id}:T{self._arrival_tick}"
+
+    def _wait_for_slot(self, kind: str) -> int:
+        """Busy-poll ``xlayer_poll(kind)`` until at least one slot is ready.
+
+        Returns the first ready ``slot_idx``.  Raises ``TimeoutError`` after
+        ``_XLAYER_POLL_MAX_ITERS`` iterations (~50 ms on H20 NVLink).
+        """
+        for _ in range(_XLAYER_POLL_MAX_ITERS):
+            raw = self._call_xlayer("xlayer_poll", kind=kind)
+            slots = self._normalize_ready_slots(raw, expected_kind=kind)
+            if slots:
+                return slots[0]
+        raise TimeoutError(
+            f"xlayer_poll(kind={kind!r}) did not produce a ready slot after "
+            f"{_XLAYER_POLL_MAX_ITERS} iterations. "
+            f"Check that all ranks are participating in the collective."
+        )
+
+    @staticmethod
+    def _extract_num_recv_tokens_per_expert(
+        handle: Any,
+    ) -> Optional[torch.Tensor]:
+        """Surface the per-expert received-token count from an XLayerHandle."""
+        ep_h = getattr(handle, "ep_handle", None)
+        if ep_h is None:
+            return None
+        for attr in ("num_recv_tokens_per_expert", "psum_num_recv_tokens_per_expert"):
+            val = getattr(ep_h, attr, None)
+            if val is not None:
+                return val
+        return None
+
+    @classmethod
+    def release_request_all(cls, request_id: str) -> None:
+        """Call ``XLayerScheduler.release_request`` on every active instance.
+
+        Should be invoked when a request finishes to recycle its ticket and
+        free any stale handles in the scheduler's bookkeeping.
+        """
+        for impl in cls._all_instances:
+            if impl._scheduler is not None:
+                try:
+                    impl._scheduler.release_request(request_id)
+                except Exception:
+                    pass
+
+    @classmethod
+    def run_micro_phase_driver_all(cls) -> None:
+        """Execute one phase tick on every active XLayer instance.
+
+        This is the **model-runner integration point** for P3: it should be
+        called from a ``DeepEPDispatcher`` dispatch hook (registered by
+        ``XLayerDeepEPDispatcher.__init__``) so that any dispatch/combine
+        payloads that were enqueued in ``_phase_state`` by a previous
+        ``dispatch_a`` call are submitted to the XLayerScheduler (via
+        ``enter_phase`` + ``plan_dispatch`` / ``plan_combine``) before
+        ``dispatch_b`` attempts to read the results.
+
+        In the current *direct poll path* (P3, no ``enter_phase`` per layer)
+        the pending queues will be empty and the method is a no-op.  It
+        becomes meaningful in the *phase-driver path* (P3.5+) where
+        ``_dispatch_core`` enqueues payloads asynchronously.
+
+        The per-instance guard ``_phase_state._pending_dispatch or
+        _phase_state._ffn_ready`` ensures that we only cross the
+        ``enter_phase`` barrier when there is actually work to submit,
+        preventing spurious all-rank synchronisations.
+        """
+        for impl in cls._all_instances:
+            if impl._scheduler is None:
+                continue
+            if not (
+                impl._phase_state._pending_dispatch or impl._phase_state._ffn_ready
+            ):
+                continue
+            try:
+                impl._run_micro_phase_driver()
+            except Exception as exc:
+                logger.debug(
+                    "run_micro_phase_driver_all: skipped instance layer_id=%s: %s",
+                    getattr(impl, "layer_id", "?"),
+                    exc,
+                )
+
+    def _warn_and_fallback(self, exc: Exception):
+        if not self._warned_fallback:
+            logger.warning(
+                "Falling back to DeepEP normal dispatcher because the XLayer path is unavailable: %s",
+                exc,
+            )
+            self.__class__._warned_fallback = True
+
+    def _call_xlayer(self, method_name: str, **kwargs):
+        if self._scheduler is None:
+            raise RuntimeError("XLayer scheduler is not initialized")
+        method = getattr(self._scheduler, method_name)
+        try:
+            return method(**kwargs)
+        except TypeError:
+            if method_name == "xlayer_poll":
+                return method()
+            if method_name in ("xlayer_take_dispatch", "xlayer_take_combine"):
+                return method(kwargs["slot_idx"])
+            if method_name == "xlayer_dispatch":
+                args = [
+                    kwargs["x"],
+                    kwargs["topk_idx"],
+                    kwargs["topk_weights"],
+                    kwargs["request_id"],
+                    kwargs["layer_id"],
+                ]
+                if "num_sms" in kwargs:
+                    args.append(kwargs["num_sms"])
+                if "do_cpu_sync" in kwargs:
+                    args.append(kwargs["do_cpu_sync"])
+                return method(*args)
+            if method_name == "xlayer_combine":
+                args = [kwargs["x"], kwargs["handle"]]
+                if "num_sms" in kwargs:
+                    args.append(kwargs["num_sms"])
+                return method(*args)
+            raise
+
+    def _unpack_dispatch_ret(self, ret):
+        if isinstance(ret, tuple):
+            if len(ret) == 6:
+                return ret
+            if len(ret) == 5:
+                (
+                    recv_x,
+                    recv_topk_ids,
+                    recv_topk_weights,
+                    num_recv_tokens_per_expert,
+                    event,
+                ) = ret
+                return (
+                    recv_x,
+                    recv_topk_ids,
+                    recv_topk_weights,
+                    num_recv_tokens_per_expert,
+                    self.handle,
+                    event,
+                )
+        return (
+            ret.recv_x,
+            ret.recv_topk_ids,
+            ret.recv_topk_weights,
+            ret.num_recv_tokens_per_expert,
+            ret.ep_handle,
+            ret.event,
+        )
+
+    def _unpack_combine_ret(self, ret):
+        if isinstance(ret, tuple):
+            if len(ret) >= 3:
+                a, b, c = ret[0], ret[1], ret[2]
+                if isinstance(b, int):
+                    return a, c, int(b)
+                if isinstance(c, int):
+                    return a, b, int(c)
+                return a, b, None
+            if len(ret) >= 2:
+                return ret[0], ret[1], None
+            return ret[0], None, None
+        return ret.combined_x, ret.event, getattr(ret, "active_partner_bits", None)
+
+    def _normalize_ready_slots(
+        self, ready_slots: Any, expected_kind: str = "any"
+    ) -> List[int]:
+        """Normalise ``xlayer_poll`` output into a list of ready ``slot_idx``.
+
+        Real ``xlayer_poll`` returns ``List[Tuple[kind_str, slot_idx, ticket_id,
+        layer_id]]``.  Mock tests may pass plain ints or lists of ints.
+        """
+        if not ready_slots:
+            return []
+        result: List[int] = []
+        for item in ready_slots:
+            if isinstance(item, (int, float)):
+                # Legacy / mock: bare slot index
+                result.append(int(item))
+            elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                kind, slot_idx = item[0], item[1]
+                if expected_kind in ("any", kind):
+                    result.append(int(slot_idx))
+        return result
+
+    def _run_micro_phase_driver(self) -> None:
+        """Execute one phase tick: C-micro then D-micro, then drain ready slots.
+
+        This is the full PhaseScheduler-driven path used when model-runner
+        integration is active (P3.5+).  The current hot-path in ``_dispatch_core``
+        / ``_combine_core`` bypasses this in favour of a direct poll loop so that
+        a blocking ``enter_phase`` barrier is not inserted per layer.
+        """
+        self._call_xlayer("enter_phase")
+
+        for key in self._phase_state.plan_combine():
+            self._call_xlayer(
+                "xlayer_combine", **self._phase_state.pop_combine_payload(key)
+            )
+
+        for key in self._phase_state.plan_dispatch():
+            self._call_xlayer(
+                "xlayer_dispatch", **self._phase_state.pop_dispatch_payload(key)
+            )
+
+        # Drain all ready dispatch slots, keying results by (rid, layer_id).
+        dispatch_raw = self._call_xlayer("xlayer_poll", kind="dispatch")
+        for slot_idx in self._normalize_ready_slots(dispatch_raw, "dispatch"):
+            ret = self._call_xlayer("xlayer_take_dispatch", slot_idx=slot_idx)
+            recv_x, recv_topk_idx, recv_topk_weights, handle = ret
+            key = (handle.request_id, handle.layer_id)
+            self._phase_state.mark_dispatch_ready(key, ret)
+
+        # Drain all ready combine slots.
+        combine_raw = self._call_xlayer("xlayer_poll", kind="combine")
+        for slot_idx in self._normalize_ready_slots(combine_raw, "combine"):
+            ret = self._call_xlayer("xlayer_take_combine", slot_idx=slot_idx)
+            # ret = (request_id, layer_id, src_rank, topk_weights, combined_x, is_last)
+            if isinstance(ret, (tuple, list)) and len(ret) >= 2:
+                rid, lid = ret[0], ret[1]
+                key = (rid, lid)
+            else:
+                key = (self._last_request_id, self.layer_id)
+            self._phase_state.mark_combine_ready(key, ret)
+
+        self._phase_state.advance_phase()
+
+    def _dispatch_core(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        previous_event,
+    ):
+        """Dispatch via XLayerScheduler (direct poll path, no enter_phase).
+
+        Each call is single-shot: one ``xlayer_dispatch`` submission followed by
+        a busy-poll loop until the slot is ready.  This preserves the DeepEP
+        lockstep invariant (all ranks must call dispatch in the same order) while
+        avoiding the per-layer blocking ``enter_phase`` barrier that would be
+        needed for the full multi-in-flight PhaseScheduler path.
+
+        Falls back to the regular DeepEP normal path if the scheduler is not
+        available or if ``SGLANG_XLAYER_STRICT=0`` and any error occurs.
+        """
+        if self._scheduler is None:
+            return super()._dispatch_core(x, topk_ids, topk_weights, previous_event)
+
+        request_id = self._get_batch_request_id()
+        key = (request_id, self.layer_id)
+        self._last_request_id = request_id
+        slot_info = ExpertSlotInfo(
+            layer_id=self.layer_id,
+            arrival_tick=self._arrival_tick,
+            request_id=request_id,
+            rank_id=self._rank,
+        )
+        self._arrival_tick += 1
+        self._expert_slot_infos[key] = slot_info
+
+        try:
+            # 1. Submit asynchronous dispatch.
+            self._call_xlayer(
+                "xlayer_dispatch",
+                **self._build_xlayer_dispatch_payload(
+                    x, topk_ids, topk_weights, request_id
+                ),
+            )
+
+            # 2. Busy-poll until dispatch completes on the comm stream.
+            slot_idx = self._wait_for_slot("dispatch")
+
+            # 3. Take: current stream waits on comm event, returns recv tensors.
+            recv_x, recv_topk_idx, recv_topk_weights, handle = self._call_xlayer(
+                "xlayer_take_dispatch", slot_idx=slot_idx
+            )
+            self.handle = handle
+
+            num_recv_tokens_per_expert = self._extract_num_recv_tokens_per_expert(
+                handle
+            )
+            return (
+                recv_x,
+                recv_topk_idx,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                _NoopEvent(),
+            )
+        except Exception as e:
+            if get_bool_env_var("SGLANG_XLAYER_STRICT"):
+                raise
+            self._warn_and_fallback(e)
+            return super()._dispatch_core(x, topk_ids, topk_weights, previous_event)
+
+    def _combine_core(self, x: torch.Tensor, previous_event):
+        """Combine via XLayerScheduler (direct poll path).
+
+        P2 / MVP semantics: one ``xlayer_combine`` → single poll → ``is_last=True``.
+        Full P3.5 multi-phase semantics (partial accumulation per C-micro phase)
+        are supported by the ``PartialAggregator`` loop below — the aggregator
+        keeps accumulating until ``partner_expected_bits`` are all covered or
+        ``is_last=True``.
+        """
+        if self._scheduler is None or self._last_request_id is None:
+            return super()._combine_core(x, previous_event)
+
+        key = (self._last_request_id, self.layer_id)
+
+        try:
+            handle = self.handle
+            if handle is None:
+                raise RuntimeError(
+                    f"No active handle for key={key}; dispatch must precede combine."
+                )
+
+            # Derive partner bitmask for the aggregator.
+            try:
+                expected_bits = int(
+                    self._call_xlayer(
+                        "involved_rank_bitmask_for",
+                        request_id=self._last_request_id,
+                        layer_id=self.layer_id,
+                    )
+                )
+            except (RuntimeError, KeyError):
+                # Legacy backend or bitmask not yet available: assume all other
+                # ranks participate.  Aggregator completes on is_last=True.
+                full_mask = (1 << self._num_ranks) - 1
+                expected_bits = int(full_mask & _PARTNER_BITS_MASK)
+
+            aggregator = PartialAggregator(
+                y_accum=torch.zeros_like(x),
+                ep_handle=handle,
+                partner_expected_bits=expected_bits,
+            )
+            aggregator.mark_dispatch_submitted()
+
+            event: Any = _NoopEvent()
+            # Loop: each iteration covers one C-micro partial contribution.
+            # In single-shot MVP the first iteration is always is_last=True.
+            max_rounds = max(1, aggregator.expected_partner_count)
+            for _ in range(max_rounds):
+                self._call_xlayer(
+                    "xlayer_combine",
+                    **self._build_xlayer_combine_payload(x),
+                )
+
+                slot_idx = self._wait_for_slot("combine")
+                raw = self._call_xlayer("xlayer_take_combine", slot_idx=slot_idx)
+
+                # Unpack return value.  Three formats are supported:
+                #   (a) Real xlayer_take_combine 6-tuple:
+                #         (request_id, layer_id, src_rank_idx,
+                #          combined_topk_weights, combined_x, is_last)
+                #   (b) Legacy 3-tuple used in mock tests:
+                #         (partial_y, active_bits_int, event)
+                #   (c) Fallback: treat as bare tensor (is_last=True).
+                if isinstance(raw, (tuple, list)) and len(raw) == 6:
+                    _, _, src_rank_idx, _, partial_y, is_last = raw
+                    # One bit per contributing rank — do NOT use expected_bits here,
+                    # as that would incorrectly mark all partners done on round 1.
+                    active_bits = 1 << int(src_rank_idx)
+                    is_last = bool(is_last)
+                elif isinstance(raw, (tuple, list)) and len(raw) == 3:
+                    # Mock/test format: (partial_y, active_bits_int, event)
+                    partial_y, active_bits, _ = raw
+                    active_bits = int(active_bits)
+                    is_last = False  # rely on aggregator completion check
+                elif isinstance(raw, (tuple, list)) and len(raw) >= 2:
+                    partial_y = raw[0]
+                    is_last = bool(raw[-1]) if isinstance(raw[-1], bool) else True
+                    active_bits = expected_bits
+                else:
+                    partial_y, is_last, active_bits = raw, True, expected_bits
+
+                done = aggregator.add_partial_bits(active_bits, partial_y)
+                if is_last or done:
+                    break
+
+            combined = aggregator.y_accum
+            aggregator.release()
+            self._aggregators.pop(key, None)
+            self._expert_slot_infos.pop(key, None)
+            return combined, event
+
+        except Exception as e:
+            if get_bool_env_var("SGLANG_XLAYER_STRICT"):
+                raise
+            self._warn_and_fallback(e)
+            self._aggregators.pop(key, None)
+            return super()._combine_core(x, previous_event)
+
+
 @dataclass
 class _Stage(Enum):
     INITIAL = auto()
@@ -896,3 +1608,52 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+
+class XLayerDeepEPDispatcher(DeepEPDispatcher):
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool = False,
+        num_experts: int = None,
+        num_local_experts: int = None,
+        hidden_size: int = None,
+        params_dtype: torch.dtype = None,
+        deepep_mode: DeepEPMode = DeepEPMode.NORMAL,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+        layer_id: int = 0,
+    ):
+        BaseDispatcher.__init__(self)
+        del return_recv_hook
+        if deepep_mode.enable_low_latency():
+            raise ValueError(
+                "XLayerDeepEPDispatcher currently supports DeepEP normal mode only."
+            )
+        self.deepep_mode = deepep_mode
+        self._normal_dispatcher = _DeepEPDispatcherImplXLayer(
+            layer_id=layer_id,
+            async_finish=async_finish,
+            group=group,
+            router_topk=router_topk,
+            permute_fusion=permute_fusion,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=params_dtype,
+            deepep_mode=deepep_mode,
+        )
+        self._stage = _Stage.INITIAL
+        self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
+
+        # Register the phase-driver hook.  This hook fires between
+        # ``dispatch_a`` and ``dispatch_b`` in the model-runner's forward
+        # pass.  In the current *direct poll path* (P3) the pending queues
+        # are always empty, so the call is a no-op with zero overhead.
+        # In the future *phase-driver path* (P3.5+), ``dispatch_a`` will
+        # enqueue payloads asynchronously and this hook will submit them in
+        # one ``enter_phase`` batch before ``dispatch_b`` reads the results.
+        self._deepep_dispatch_hooks.register_hook(
+            lambda _: _DeepEPDispatcherImplXLayer.run_micro_phase_driver_all()
+        )

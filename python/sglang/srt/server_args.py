@@ -544,6 +544,7 @@ class ServerArgs:
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
+    enable_xlayer_dispatcher: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -5459,6 +5460,12 @@ class ServerArgs:
             "--enable-aiter-allreduce-fusion",
             action="store_true",
             help="Enable Aiter AllReduce Fusion.",
+        )
+        parser.add_argument(
+            "--enable-xlayer-dispatcher",
+            action="store_true",
+            default=ServerArgs.enable_xlayer_dispatcher,
+            help="Enable experimental DeepEP XLayer dispatcher for cross-layer async scheduling.",
         )
         parser.add_argument(
             "--deepep-mode",

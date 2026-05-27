@@ -23,6 +23,16 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 
+try:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        _DeepEPDispatcherImplXLayer,
+    )
+
+    _HAS_XLAYER_DISPATCHER = True
+except ImportError:
+    _DeepEPDispatcherImplXLayer = None  # type: ignore[assignment,misc]
+    _HAS_XLAYER_DISPATCHER = False
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
@@ -571,6 +581,10 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+
+            # Recycle XLayerScheduler ticket to free per-request bookkeeping.
+            if _HAS_XLAYER_DISPATCHER and self.server_args.enable_xlayer_dispatcher:
+                _DeepEPDispatcherImplXLayer.release_request_all(req.rid)
 
             req.time_stats.set_completion_time()
 
