@@ -833,7 +833,14 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
     def _init_scheduler(self):
         if XLayerScheduler is None:
             return None
-        return XLayerScheduler(self._buffer)
+        try:
+            return XLayerScheduler(self._buffer)
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize XLayerScheduler (XLayer path will fall back to DeepEP): %s",
+                e,
+            )
+            return None
 
     def _warn_and_fallback(self, exc: Exception):
         if not self._warned_fallback:
@@ -901,13 +908,18 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
 
     def _take_ready_slot(self, poll_kind: Optional[str] = None) -> int:
         poll_kwargs = {"kind": poll_kind} if poll_kind is not None else {}
+        poll_kind_name = poll_kind or "any"
         ready_slots = self._call_xlayer("xlayer_poll", **poll_kwargs)
         if ready_slots is None:
-            raise RuntimeError("xlayer_poll returned no ready slots")
+            raise RuntimeError(
+                f"xlayer_poll(kind={poll_kind_name}) returned None; scheduler did not provide ready slots"
+            )
         if isinstance(ready_slots, int):
             return ready_slots
         if len(ready_slots) == 0:
-            raise RuntimeError("xlayer_poll returned empty ready slots")
+            raise RuntimeError(
+                f"xlayer_poll(kind={poll_kind_name}) returned an empty list of ready slots"
+            )
         return int(ready_slots[0])
 
     def _dispatch_core(
@@ -918,6 +930,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         previous_event,
     ):
         arrival_tick = self._arrival_tick
+        # Keep request_id rank-independent to preserve cross-rank lockstep semantics.
         request_id = f"L{self.layer_id}:T{arrival_tick}"
         self._arrival_tick += 1
         self._last_request_id = request_id
@@ -941,7 +954,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
                 config=DeepEPConfig.get_instance().normal_dispatch_config,
             )
-            slot_idx = self._take_ready_slot()
+            slot_idx = self._take_ready_slot(poll_kind="dispatch")
             ret = self._call_xlayer("xlayer_take_dispatch", slot_idx=slot_idx)
             recv_x, recv_topk_ids, recv_topk_weights, num_recv_tokens_per_expert, handle, event = self._unpack_dispatch_ret(
                 ret
@@ -993,7 +1006,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 allocate_on_comm_stream=previous_event is not None,
                 config=DeepEPConfig.get_instance().normal_combine_config,
             )
-            slot_idx = self._take_ready_slot()
+            slot_idx = self._take_ready_slot(poll_kind="combine")
             ret = self._call_xlayer("xlayer_take_combine", slot_idx=slot_idx)
             partial, event, active_partner_bits = self._unpack_combine_ret(ret)
             is_complete = aggregator.add_partial_bits(

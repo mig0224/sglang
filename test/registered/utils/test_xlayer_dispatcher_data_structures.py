@@ -72,7 +72,8 @@ class TestXLayerDispatcherDataStructures(unittest.TestCase):
         impl._warn_and_fallback = _raise_unexpected_fallback
 
         call_log = []
-        poll_slots = [[17], [21], [22]]
+        dispatch_slot = 17
+        poll_slots = [[dispatch_slot], [21], [22]]
         partial1 = torch.ones((2, 3), dtype=torch.float32)
         partial2 = torch.full((2, 3), 2.0, dtype=torch.float32)
         dispatch_ret = (
@@ -92,13 +93,18 @@ class TestXLayerDispatcherDataStructures(unittest.TestCase):
         def fake_call_xlayer(method_name: str, **kwargs):
             call_log.append((method_name, kwargs))
             if method_name == "xlayer_dispatch":
+                self.assertTrue(torch.equal(kwargs["x"], x))
+                self.assertTrue(torch.equal(kwargs["topk_idx"], topk_ids))
+                self.assertTrue(torch.equal(kwargs["topk_weights"], topk_weights))
                 return None
             if method_name == "xlayer_poll":
                 return poll_slots.pop(0)
             if method_name == "xlayer_take_dispatch":
-                self.assertEqual(kwargs["slot_idx"], 17)
+                self.assertEqual(kwargs["slot_idx"], dispatch_slot)
                 return dispatch_ret
             if method_name == "involved_rank_bitmask_for":
+                self.assertEqual(kwargs["request_id"], impl._last_request_id)
+                self.assertEqual(kwargs["layer_id"], impl.layer_id)
                 return expected_bits
             if method_name == "xlayer_combine":
                 self.assertEqual(kwargs["active_partner_bits"], expected_bits)
