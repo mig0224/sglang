@@ -88,6 +88,10 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
     elif a2a_backend.is_deepep() and is_xlayer_dispatcher_enabled():
+        if moe_runner_config.layer_id is None:
+            raise ValueError(
+                "XLayerDeepEPDispatcher requires an explicit MoeRunnerConfig.layer_id."
+            )
         return XLayerDeepEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -99,7 +103,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=DeepEPMode.NORMAL,
             async_finish=True,
             return_recv_hook=False,
-            layer_id=moe_runner_config.layer_id or 0,
+            layer_id=moe_runner_config.layer_id,
         )
     elif (
         a2a_backend.is_deepep()

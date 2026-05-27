@@ -60,6 +60,7 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+_PARTNER_BITS_MASK = (1 << 64) - 1
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -774,7 +775,7 @@ class PartialAggregator:
     state: PartialAggregatorState = PartialAggregatorState.S_INIT
 
     def __post_init__(self):
-        self.partner_expected_bits &= (1 << 64) - 1
+        self.partner_expected_bits &= _PARTNER_BITS_MASK
         self.expected_partner_count = int(self.partner_expected_bits.bit_count())
 
     def mark_dispatch_submitted(self) -> None:
@@ -796,6 +797,21 @@ class PartialAggregator:
             return True
         return False
 
+    def add_partial_bits(self, active_partner_bits: int, partial_output: torch.Tensor) -> bool:
+        self.y_accum.add_(partial_output)
+        self.state = PartialAggregatorState.S_AWAITING_PARTIALS
+        masked_bits = int(active_partner_bits) & _PARTNER_BITS_MASK
+        newly_received_bits = (
+            masked_bits & self.partner_expected_bits & (~self.partner_received_bits)
+        )
+        if newly_received_bits:
+            self.partner_received_bits |= newly_received_bits
+            self.received_partner_count += newly_received_bits.bit_count()
+        if self.received_partner_count >= self.expected_partner_count:
+            self.state = PartialAggregatorState.S_AGGREGATE_COMPLETE
+            return True
+        return False
+
     def release(self) -> None:
         self.state = PartialAggregatorState.S_RELEASED
 
@@ -811,18 +827,20 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         self._aggregators: Dict[Tuple[str, int], PartialAggregator] = {}
         self._expert_slot_infos: Dict[Tuple[str, int], ExpertSlotInfo] = {}
         self._rank = dist.get_rank(group=self.group)
+        self._buffer = self._get_buffer()
         self._scheduler = self._init_scheduler()
 
     def _init_scheduler(self):
         if XLayerScheduler is None:
             return None
         try:
-            return XLayerScheduler(group=self.group, hidden_size=self.hidden_size)
-        except TypeError:
-            try:
-                return XLayerScheduler(group=self.group)
-            except TypeError:
-                return XLayerScheduler()
+            return XLayerScheduler(self._buffer)
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize XLayerScheduler (XLayer path will fall back to DeepEP): %s",
+                e,
+            )
+            return None
 
     def _warn_and_fallback(self, exc: Exception):
         if not self._warned_fallback:
@@ -842,7 +860,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             if method_name == "xlayer_poll":
                 return method()
             if method_name in ("xlayer_take_dispatch", "xlayer_take_combine"):
-                return method(kwargs["request_id"], kwargs["layer_id"])
+                return method(kwargs["slot_idx"])
             if method_name == "xlayer_dispatch":
                 return method(kwargs["x"], kwargs["topk_idx"], kwargs["topk_weights"])
             if method_name == "xlayer_combine":
@@ -876,10 +894,33 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
 
     def _unpack_combine_ret(self, ret):
         if isinstance(ret, tuple):
+            if len(ret) >= 3:
+                a, b, c = ret[0], ret[1], ret[2]
+                if isinstance(b, int):
+                    return a, c, int(b)
+                if isinstance(c, int):
+                    return a, b, int(c)
+                return a, b, None
             if len(ret) >= 2:
-                return ret[0], ret[1]
-            return ret[0], None
-        return ret.combined_x, ret.event
+                return ret[0], ret[1], None
+            return ret[0], None, None
+        return ret.combined_x, ret.event, getattr(ret, "active_partner_bits", None)
+
+    def _take_ready_slot(self, poll_kind: Optional[str] = None) -> int:
+        poll_kwargs = {"kind": poll_kind} if poll_kind is not None else {}
+        poll_kind_name = poll_kind or "any"
+        ready_slots = self._call_xlayer("xlayer_poll", **poll_kwargs)
+        if ready_slots is None:
+            raise RuntimeError(
+                f"xlayer_poll(kind={poll_kind_name}) returned None; scheduler did not provide ready slots"
+            )
+        if isinstance(ready_slots, int):
+            return ready_slots
+        if len(ready_slots) == 0:
+            raise RuntimeError(
+                f"xlayer_poll(kind={poll_kind_name}) returned an empty list of ready slots"
+            )
+        return int(ready_slots[0])
 
     def _dispatch_core(
         self,
@@ -889,7 +930,8 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         previous_event,
     ):
         arrival_tick = self._arrival_tick
-        request_id = f"{self.layer_id}:{arrival_tick}:{self._rank}"
+        # Keep request_id rank-independent to preserve cross-rank lockstep semantics.
+        request_id = f"L{self.layer_id}:T{arrival_tick}"
         self._arrival_tick += 1
         self._last_request_id = request_id
         self._expert_slot_infos[(request_id, self.layer_id)] = ExpertSlotInfo(
@@ -912,10 +954,8 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
                 config=DeepEPConfig.get_instance().normal_dispatch_config,
             )
-            self._call_xlayer("xlayer_poll")
-            ret = self._call_xlayer(
-                "xlayer_take_dispatch", request_id=request_id, layer_id=self.layer_id
-            )
+            slot_idx = self._take_ready_slot(poll_kind="dispatch")
+            ret = self._call_xlayer("xlayer_take_dispatch", slot_idx=slot_idx)
             recv_x, recv_topk_ids, recv_topk_weights, num_recv_tokens_per_expert, handle, event = self._unpack_dispatch_ret(
                 ret
             )
@@ -928,6 +968,8 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 event,
             )
         except Exception as e:
+            if get_bool_env_var("SGLANG_XLAYER_STRICT"):
+                raise
             self._warn_and_fallback(e)
             return super()._dispatch_core(x, topk_ids, topk_weights, previous_event)
 
@@ -964,19 +1006,23 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 allocate_on_comm_stream=previous_event is not None,
                 config=DeepEPConfig.get_instance().normal_combine_config,
             )
-            self._call_xlayer("xlayer_poll")
-            ret = self._call_xlayer(
-                "xlayer_take_combine",
-                request_id=self._last_request_id,
-                layer_id=self.layer_id,
+            slot_idx = self._take_ready_slot(poll_kind="combine")
+            ret = self._call_xlayer("xlayer_take_combine", slot_idx=slot_idx)
+            partial, event, active_partner_bits = self._unpack_combine_ret(ret)
+            is_complete = aggregator.add_partial_bits(
+                int(partner_expected_bits)
+                if active_partner_bits is None
+                else int(active_partner_bits),
+                partial,
             )
-            partial, event = self._unpack_combine_ret(ret)
-            aggregator.add_partial(self._rank, partial)
             combined = aggregator.y_accum
-            aggregator.release()
-            del self._aggregators[key]
+            if is_complete:
+                aggregator.release()
+                del self._aggregators[key]
             return combined, event
         except Exception as e:
+            if get_bool_env_var("SGLANG_XLAYER_STRICT"):
+                raise
             self._warn_and_fallback(e)
             if key in self._aggregators:
                 del self._aggregators[key]
