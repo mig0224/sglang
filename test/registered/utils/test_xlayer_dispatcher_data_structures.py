@@ -97,14 +97,15 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
         impl = _DeepEPDispatcherImplXLayer.__new__(_DeepEPDispatcherImplXLayer)
         impl.layer_id = 4
         impl._arrival_tick = 0
-        # Exercise the inline driver path explicitly; production defaults this off.
-        impl._allow_inline_phase_driving = True
         impl._last_request_id = None
         impl._aggregators = {}
         impl._expert_slot_infos = {}
         impl._rank = 0
+        impl._num_ranks = 8
         impl.async_finish = True
         impl.handle = object()
+        # A non-None scheduler prevents the fallback branch from activating.
+        impl._scheduler = object()
         impl._phase_state = PhaseScheduler(k_d=8, k_c=8)
 
         def _raise_unexpected_fallback(exc):
@@ -114,25 +115,28 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
 
         call_log = []
         dispatch_slot = 17
+        # P3 direct-poll path: dispatch poll returns bare slot int (legacy-compat),
+        # then empty, to exercise the busy-poll loop.
         poll_schedule = {
             "dispatch": [[dispatch_slot], [], []],
             "combine": [[], [21], [22]],
         }
         partial1 = torch.ones((2, 3), dtype=torch.float32)
         partial2 = torch.full((2, 3), 2.0, dtype=torch.float32)
+        # Real xlayer_take_dispatch now returns 4-tuple: (recv_x, topk_idx, topk_w, handle)
         dispatch_ret = (
             partial1,
             torch.zeros((2, 2), dtype=torch.int64),
             torch.ones((2, 2), dtype=torch.float32),
-            [2, 0],
             "handle-after-dispatch",
-            "dispatch-event",
         )
-        combine_returns = {
-            21: (partial1, 1 << 1, "combine-event-1"),
-            22: (partial2, 1 << 3, "combine-event-2"),
-        }
         expected_bits = (1 << 1) | (1 << 3)
+        # Real xlayer_take_combine returns 6-tuple:
+        #   (request_id, layer_id, src_rank_idx, combined_topk_w, combined_x, is_last)
+        combine_returns = {
+            21: ("some-rid", 4, 1, None, partial1, False),  # src_rank=1 → bit 1
+            22: ("some-rid", 4, 3, None, partial2, True),   # src_rank=3 → bit 3, last
+        }
 
         def fake_call_xlayer(method_name: str, **kwargs):
             call_log.append((method_name, kwargs))
@@ -152,8 +156,6 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
                 self.assertTrue(torch.equal(kwargs["x"], x))
                 self.assertTrue(torch.equal(kwargs["topk_idx"], topk_ids))
                 self.assertTrue(torch.equal(kwargs["topk_weights"], topk_weights))
-                return None
-            if method_name == "enter_phase":
                 return None
             if method_name == "xlayer_poll":
                 kind = kwargs["kind"]
@@ -197,8 +199,10 @@ class TestXLayerDispatcherDataStructures(CustomTestCase):
             self.assertNotIn(key, impl._aggregators)
 
         method_order = [name for name, _ in call_log]
-        self.assertIn("enter_phase", method_order)
+        # P3 direct-poll path: no enter_phase; dispatch and combine go via xlayer_* directly.
+        self.assertNotIn("enter_phase", method_order)
         self.assertIn("xlayer_dispatch", method_order)
+        self.assertIn("xlayer_take_dispatch", method_order)
         self.assertIn(("xlayer_take_combine", {"slot_idx": 21}), call_log)
         self.assertIn(("xlayer_take_combine", {"slot_idx": 22}), call_log)
 
