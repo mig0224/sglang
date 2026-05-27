@@ -794,6 +794,9 @@ class PhaseScheduler:
 
     def register_layer(self, layer_id: int) -> int:
         self.max_seen_layer_id = max(self.max_seen_layer_id, int(layer_id))
+        return self.num_max_inflight_pairs()
+
+    def num_max_inflight_pairs(self) -> int:
         return max(1, (self.max_seen_layer_id + 1) * 2)
 
     def enqueue_dispatch(
@@ -966,7 +969,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         xlayer_set_config = getattr(scheduler, "xlayer_set_config", None)
         if xlayer_set_config is None:
             return
-        num_max_inflight_pairs = self._phase_state.register_layer(self.layer_id)
+        num_max_inflight_pairs = self._phase_state.num_max_inflight_pairs()
         try:
             xlayer_set_config(num_max_inflight_pairs=num_max_inflight_pairs)
         except TypeError:
@@ -1176,8 +1179,8 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 self._aggregators[key] = aggregator
 
             event = None
-            num_partner_steps = max(1, aggregator.expected_partner_count)
-            for _ in range(num_partner_steps):
+            expected_combine_submissions = max(1, aggregator.expected_partner_count)
+            for _ in range(expected_combine_submissions):
                 self._phase_state.enqueue_combine(
                     key=key,
                     slot_info=self._expert_slot_infos[key],
@@ -1219,7 +1222,7 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             else:
                 # Timed out waiting for all expected partners within this combine loop.
                 raise RuntimeError(
-                    f"XLayer combine did not reach completion for key={key} within {num_partner_steps} micro-phases"
+                    f"XLayer combine did not reach completion for key={key} within {expected_combine_submissions} combine submissions"
                 )
 
             combined = aggregator.y_accum
