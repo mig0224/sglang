@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
@@ -61,6 +72,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 _PARTNER_BITS_MASK = (1 << 64) - 1
+# Conservative spin cap to avoid infinite loops when no slot becomes ready while
+# still allowing several micro-phase turns before fallback.
+_MAX_DRIVER_SPIN_FACTOR = 16
+_MIN_DRIVER_SPIN_BASE = 8
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -758,10 +773,106 @@ class PartialAggregatorState(Enum):
 
 @dataclass(order=True)
 class ExpertSlotInfo:
+    # Ordering key used by phase planning: layer first, then per-layer arrival/request.
     layer_id: int
     arrival_tick: int
     request_id: str
-    rank_id: int
+    # Exclude rank_id from ordering to keep cross-rank plan ordering lockstep-safe.
+    rank_id: int = field(compare=False)
+
+
+class PhaseScheduler:
+    def __init__(self, k_d: int, k_c: int):
+        self.k_d = max(1, int(k_d))
+        self.k_c = max(1, int(k_c))
+        self.phase_id = 0
+        self.max_seen_layer_id = -1
+        self._pending_dispatch: Dict[Tuple[str, int], Tuple[ExpertSlotInfo, dict]] = {}
+        self._ffn_ready: Dict[Tuple[str, int], Tuple[ExpertSlotInfo, dict]] = {}
+        self._dispatch_submitted: Deque[Tuple[str, int]] = deque()
+        self._combine_submitted: Deque[Tuple[str, int]] = deque()
+        self._dispatch_ready: Dict[Tuple[str, int], Any] = {}
+        self._combine_ready: Dict[Tuple[str, int], List[Any]] = {}
+
+    def register_layer(self, layer_id: int) -> int:
+        self.max_seen_layer_id = max(self.max_seen_layer_id, int(layer_id))
+        return self.num_max_inflight_pairs()
+
+    def num_max_inflight_pairs(self) -> int:
+        return max(1, (self.max_seen_layer_id + 1) * 2)
+
+    def enqueue_dispatch(
+        self, key: Tuple[str, int], slot_info: ExpertSlotInfo, payload: dict
+    ) -> None:
+        self._pending_dispatch[key] = (slot_info, payload)
+
+    def enqueue_combine(
+        self, key: Tuple[str, int], slot_info: ExpertSlotInfo, payload: dict
+    ) -> None:
+        self._ffn_ready[key] = (slot_info, payload)
+
+    def plan_combine(self) -> List[Tuple[str, int]]:
+        # C-micro priority follows design: (layer_id, request_id/rid, arrival_tick).
+        plan = sorted(
+            self._ffn_ready.keys(),
+            key=lambda key: (
+                self._ffn_ready[key][0].layer_id,
+                self._ffn_ready[key][0].request_id,
+                self._ffn_ready[key][0].arrival_tick,
+            ),
+        )
+        return plan[: self.k_c]
+
+    def plan_dispatch(self) -> List[Tuple[str, int]]:
+        # D-micro priority follows design: (layer_id, arrival_tick, request_id/rid).
+        plan = sorted(
+            self._pending_dispatch.keys(),
+            key=lambda key: (
+                self._pending_dispatch[key][0].layer_id,
+                self._pending_dispatch[key][0].arrival_tick,
+                self._pending_dispatch[key][0].request_id,
+            ),
+        )
+        return plan[: self.k_d]
+
+    def pop_dispatch_payload(self, key: Tuple[str, int]) -> dict:
+        _, payload = self._pending_dispatch.pop(key)
+        self._dispatch_submitted.append(key)
+        return payload
+
+    def pop_combine_payload(self, key: Tuple[str, int]) -> dict:
+        _, payload = self._ffn_ready.pop(key)
+        self._combine_submitted.append(key)
+        return payload
+
+    def mark_dispatch_ready(self, ret: Any) -> Optional[Tuple[str, int]]:
+        if not self._dispatch_submitted:
+            return None
+        key = self._dispatch_submitted.popleft()
+        self._dispatch_ready[key] = ret
+        return key
+
+    def mark_combine_ready(self, ret: Any) -> Optional[Tuple[str, int]]:
+        if not self._combine_submitted:
+            return None
+        key = self._combine_submitted.popleft()
+        self._combine_ready.setdefault(key, []).append(ret)
+        return key
+
+    def take_dispatch_ready(self, key: Tuple[str, int]) -> Optional[Any]:
+        return self._dispatch_ready.pop(key, None)
+
+    def take_combine_ready(self, key: Tuple[str, int]) -> Optional[Any]:
+        ready = self._combine_ready.get(key)
+        if not ready:
+            return None
+        ret = ready.pop(0)
+        if not ready:
+            del self._combine_ready[key]
+        return ret
+
+    def advance_phase(self) -> None:
+        self.phase_id += 1
 
 
 @dataclass
@@ -786,10 +897,9 @@ class PartialAggregator:
         self.state = PartialAggregatorState.S_AWAITING_PARTIALS
         if 0 <= partner_rank < 64:
             partner_bit = 1 << partner_rank
-            if (
-                (self.partner_expected_bits & partner_bit) != 0
-                and (self.partner_received_bits & partner_bit) == 0
-            ):
+            if (self.partner_expected_bits & partner_bit) != 0 and (
+                self.partner_received_bits & partner_bit
+            ) == 0:
                 self.partner_received_bits |= partner_bit
                 self.received_partner_count += 1
         if self.received_partner_count >= self.expected_partner_count:
@@ -797,7 +907,9 @@ class PartialAggregator:
             return True
         return False
 
-    def add_partial_bits(self, active_partner_bits: int, partial_output: torch.Tensor) -> bool:
+    def add_partial_bits(
+        self, active_partner_bits: int, partial_output: torch.Tensor
+    ) -> bool:
         self.y_accum.add_(partial_output)
         self.state = PartialAggregatorState.S_AWAITING_PARTIALS
         masked_bits = int(active_partner_bits) & _PARTNER_BITS_MASK
@@ -818,6 +930,7 @@ class PartialAggregator:
 
 class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
     _warned_fallback = False
+    _shared_phase_scheduler: Optional[PhaseScheduler] = None
 
     def __init__(self, layer_id: int, **kwargs):
         super().__init__(**kwargs)
@@ -828,19 +941,42 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         self._expert_slot_infos: Dict[Tuple[str, int], ExpertSlotInfo] = {}
         self._rank = dist.get_rank(group=self.group)
         self._buffer = self._get_buffer()
+        self._phase_state = self._get_phase_scheduler()
         self._scheduler = self._init_scheduler()
+
+    def _get_phase_scheduler(self) -> PhaseScheduler:
+        if self.__class__._shared_phase_scheduler is None:
+            world_size = dist.get_world_size(group=self.group)
+            self.__class__._shared_phase_scheduler = PhaseScheduler(
+                k_d=world_size, k_c=world_size
+            )
+        phase_state = self.__class__._shared_phase_scheduler
+        phase_state.register_layer(self.layer_id)
+        return phase_state
 
     def _init_scheduler(self):
         if XLayerScheduler is None:
             return None
         try:
-            return XLayerScheduler(self._buffer)
+            scheduler = XLayerScheduler(self._buffer)
+            self._configure_xlayer_scheduler(scheduler)
+            return scheduler
         except Exception as e:
             logger.warning(
                 "Failed to initialize XLayerScheduler (XLayer path will fall back to DeepEP): %s",
                 e,
             )
             return None
+
+    def _configure_xlayer_scheduler(self, scheduler: Any) -> None:
+        xlayer_set_config = getattr(scheduler, "xlayer_set_config", None)
+        if xlayer_set_config is None:
+            return
+        num_max_inflight_pairs = self._phase_state.num_max_inflight_pairs()
+        try:
+            xlayer_set_config(num_max_inflight_pairs=num_max_inflight_pairs)
+        except TypeError:
+            xlayer_set_config(num_max_inflight_pairs)
 
     def _warn_and_fallback(self, exc: Exception):
         if not self._warned_fallback:
@@ -872,9 +1008,13 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             if len(ret) == 6:
                 return ret
             if len(ret) == 5:
-                recv_x, recv_topk_ids, recv_topk_weights, num_recv_tokens_per_expert, event = (
-                    ret
-                )
+                (
+                    recv_x,
+                    recv_topk_ids,
+                    recv_topk_weights,
+                    num_recv_tokens_per_expert,
+                    event,
+                ) = ret
                 return (
                     recv_x,
                     recv_topk_ids,
@@ -906,21 +1046,48 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
             return ret[0], None, None
         return ret.combined_x, ret.event, getattr(ret, "active_partner_bits", None)
 
-    def _take_ready_slot(self, poll_kind: Optional[str] = None) -> int:
-        poll_kwargs = {"kind": poll_kind} if poll_kind is not None else {}
-        poll_kind_name = poll_kind or "any"
-        ready_slots = self._call_xlayer("xlayer_poll", **poll_kwargs)
+    def _normalize_ready_slots(self, ready_slots: Any) -> List[int]:
         if ready_slots is None:
-            raise RuntimeError(
-                f"xlayer_poll(kind={poll_kind_name}) returned None; scheduler did not provide ready slots"
-            )
+            return []
         if isinstance(ready_slots, int):
-            return ready_slots
-        if len(ready_slots) == 0:
-            raise RuntimeError(
-                f"xlayer_poll(kind={poll_kind_name}) returned an empty list of ready slots"
+            return [int(ready_slots)]
+        return [int(slot_idx) for slot_idx in ready_slots]
+
+    def _max_driver_spins(self) -> int:
+        # Minimum base of 8 allows a few lockstep phase turns even with tiny k_d/k_c.
+        return (
+            max(_MIN_DRIVER_SPIN_BASE, self._phase_state.k_d + self._phase_state.k_c)
+            * _MAX_DRIVER_SPIN_FACTOR
+        )
+
+    def _run_micro_phase_driver(self) -> None:
+        self._call_xlayer("enter_phase")
+
+        for key in self._phase_state.plan_combine():
+            self._call_xlayer(
+                "xlayer_combine", **self._phase_state.pop_combine_payload(key)
             )
-        return int(ready_slots[0])
+
+        for key in self._phase_state.plan_dispatch():
+            self._call_xlayer(
+                "xlayer_dispatch", **self._phase_state.pop_dispatch_payload(key)
+            )
+
+        dispatch_slots = self._normalize_ready_slots(
+            self._call_xlayer("xlayer_poll", kind="dispatch")
+        )
+        for slot_idx in dispatch_slots:
+            ret = self._call_xlayer("xlayer_take_dispatch", slot_idx=slot_idx)
+            self._phase_state.mark_dispatch_ready(ret)
+
+        combine_slots = self._normalize_ready_slots(
+            self._call_xlayer("xlayer_poll", kind="combine")
+        )
+        for slot_idx in combine_slots:
+            ret = self._call_xlayer("xlayer_take_combine", slot_idx=slot_idx)
+            self._phase_state.mark_combine_ready(ret)
+
+        self._phase_state.advance_phase()
 
     def _dispatch_core(
         self,
@@ -934,31 +1101,52 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
         request_id = f"L{self.layer_id}:T{arrival_tick}"
         self._arrival_tick += 1
         self._last_request_id = request_id
-        self._expert_slot_infos[(request_id, self.layer_id)] = ExpertSlotInfo(
+        key = (request_id, self.layer_id)
+        slot_info = ExpertSlotInfo(
             layer_id=self.layer_id,
             arrival_tick=arrival_tick,
             request_id=request_id,
             rank_id=self._rank,
         )
+        self._expert_slot_infos[key] = slot_info
         try:
-            self._call_xlayer(
-                "xlayer_dispatch",
-                x=x,
-                topk_idx=topk_ids,
-                topk_weights=topk_weights,
-                request_id=request_id,
-                layer_id=self.layer_id,
-                previous_event=previous_event,
-                async_finish=self.async_finish,
-                do_cpu_sync=False,
-                expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
-                config=DeepEPConfig.get_instance().normal_dispatch_config,
+            self._phase_state.enqueue_dispatch(
+                key=key,
+                slot_info=slot_info,
+                payload={
+                    "x": x,
+                    "topk_idx": topk_ids,
+                    "topk_weights": topk_weights,
+                    "request_id": request_id,
+                    "layer_id": self.layer_id,
+                    "previous_event": previous_event,
+                    "async_finish": self.async_finish,
+                    "do_cpu_sync": False,
+                    "expert_alignment": (
+                        128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+                    ),
+                    "config": DeepEPConfig.get_instance().normal_dispatch_config,
+                },
             )
-            slot_idx = self._take_ready_slot(poll_kind="dispatch")
-            ret = self._call_xlayer("xlayer_take_dispatch", slot_idx=slot_idx)
-            recv_x, recv_topk_ids, recv_topk_weights, num_recv_tokens_per_expert, handle, event = self._unpack_dispatch_ret(
-                ret
-            )
+            ret = None
+            max_driver_spins = self._max_driver_spins()
+            for _ in range(max_driver_spins):
+                self._run_micro_phase_driver()
+                ret = self._phase_state.take_dispatch_ready(key)
+                if ret is not None:
+                    break
+            if ret is None:
+                raise RuntimeError(
+                    f"XLayer dispatch did not produce ready output for key={key} after {max_driver_spins} micro-phases"
+                )
+            (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                handle,
+                event,
+            ) = self._unpack_dispatch_ret(ret)
             self.handle = handle
             return (
                 recv_x,
@@ -993,32 +1181,56 @@ class _DeepEPDispatcherImplXLayer(_DeepEPDispatcherImplNormal):
                 aggregator.mark_dispatch_submitted()
                 self._aggregators[key] = aggregator
 
-            self._call_xlayer(
-                "xlayer_combine",
-                x=x,
-                handle=self.handle,
-                request_id=self._last_request_id,
-                layer_id=self.layer_id,
-                active_partner_bits=int(partner_expected_bits),
-                is_last=False,
-                previous_event=previous_event,
-                async_finish=self.async_finish,
-                allocate_on_comm_stream=previous_event is not None,
-                config=DeepEPConfig.get_instance().normal_combine_config,
-            )
-            slot_idx = self._take_ready_slot(poll_kind="combine")
-            ret = self._call_xlayer("xlayer_take_combine", slot_idx=slot_idx)
-            partial, event, active_partner_bits = self._unpack_combine_ret(ret)
-            is_complete = aggregator.add_partial_bits(
-                int(partner_expected_bits)
-                if active_partner_bits is None
-                else int(active_partner_bits),
-                partial,
-            )
+            event = None
+            expected_combine_submissions = max(1, aggregator.expected_partner_count)
+            is_complete = False
+            for _ in range(expected_combine_submissions):
+                self._phase_state.enqueue_combine(
+                    key=key,
+                    slot_info=self._expert_slot_infos[key],
+                    payload={
+                        "x": x,
+                        "handle": self.handle,
+                        "request_id": self._last_request_id,
+                        "layer_id": self.layer_id,
+                        "active_partner_bits": int(partner_expected_bits),
+                        "is_last": False,
+                        "previous_event": previous_event,
+                        "async_finish": self.async_finish,
+                        "allocate_on_comm_stream": previous_event is not None,
+                        "config": DeepEPConfig.get_instance().normal_combine_config,
+                    },
+                )
+                ret = None
+                max_driver_spins = self._max_driver_spins()
+                for _ in range(max_driver_spins):
+                    self._run_micro_phase_driver()
+                    ret = self._phase_state.take_combine_ready(key)
+                    if ret is not None:
+                        break
+                if ret is None:
+                    raise RuntimeError(
+                        f"XLayer combine did not produce partial output for key={key} after {max_driver_spins} micro-phases"
+                    )
+                partial, event, active_partner_bits = self._unpack_combine_ret(ret)
+                is_complete = aggregator.add_partial_bits(
+                    (
+                        int(partner_expected_bits)
+                        if active_partner_bits is None
+                        else int(active_partner_bits)
+                    ),
+                    partial,
+                )
+                if is_complete:
+                    break
+            if not is_complete:
+                raise RuntimeError(
+                    f"XLayer combine did not reach completion for key={key} within {expected_combine_submissions} combine submissions"
+                )
+
             combined = aggregator.y_accum
-            if is_complete:
-                aggregator.release()
-                del self._aggregators[key]
+            aggregator.release()
+            del self._aggregators[key]
             return combined, event
         except Exception as e:
             if get_bool_env_var("SGLANG_XLAYER_STRICT"):
